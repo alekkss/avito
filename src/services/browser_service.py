@@ -88,6 +88,10 @@ BROWSER_ARGS: list[str] = [
     "--use-mock-keychain",
 ]
 
+# Максимальное количество попыток пройти CloudFlare challenge
+MAX_CLOUDFLARE_RETRIES: int = 3
+CLOUDFLARE_WAIT_SECONDS: int = 15
+
 
 class BrowserService:
     """Сервис для управления Playwright-браузером со stealth-режимом.
@@ -208,8 +212,8 @@ class BrowserService:
         """Переходит по URL с предварительной задержкой и проверкой блокировки.
 
         Имитирует поведение реального пользователя: случайная задержка
-        перед переходом, ожидание CloudFlare challenge, проверка
-        блокировки по заголовку и содержимому страницы.
+        перед переходом, ожидание CloudFlare challenge с повторными
+        проверками, валидация загрузки контента Avito.
 
         Args:
             url: URL для перехода.
@@ -236,20 +240,50 @@ class BrowserService:
                 timeout=self._settings.navigation_timeout,
             )
 
-            # Ожидание для CloudFlare
-            await asyncio.sleep(5)
+            # Ожидание загрузки контента после первоначальной загрузки DOM
+            await asyncio.sleep(8)
 
-            is_blocked = await self._check_blocked()
-            if is_blocked:
-                logger.warning("page_blocked", url=url)
-                return False
+            # Проверяем CloudFlare challenge с повторными попытками
+            for attempt in range(1, MAX_CLOUDFLARE_RETRIES + 1):
+                status = await self._check_page_status()
 
-            logger.info(
-                "navigation_success",
+                if status == "ok":
+                    logger.info(
+                        "navigation_success",
+                        url=url,
+                        current_url=self._page.url,
+                    )
+                    return True
+
+                if status == "blocked":
+                    logger.warning("page_blocked", url=url)
+                    return False
+
+                if status == "cloudflare":
+                    logger.info(
+                        "cloudflare_challenge_waiting",
+                        attempt=attempt,
+                        max_attempts=MAX_CLOUDFLARE_RETRIES,
+                        wait_seconds=CLOUDFLARE_WAIT_SECONDS,
+                    )
+                    await asyncio.sleep(CLOUDFLARE_WAIT_SECONDS)
+
+            # Если после всех попыток CloudFlare не прошёл —
+            # проверяем, может контент всё же загрузился
+            final_status = await self._check_page_status()
+            if final_status == "ok":
+                logger.info(
+                    "navigation_success_after_retries",
+                    url=url,
+                )
+                return True
+
+            logger.warning(
+                "cloudflare_challenge_failed",
                 url=url,
-                current_url=self._page.url,
+                attempts=MAX_CLOUDFLARE_RETRIES,
             )
-            return True
+            return False
 
         except Exception as e:
             logger.error(
@@ -260,50 +294,103 @@ class BrowserService:
             )
             return False
 
+    async def _check_page_status(self) -> str:
+        """Определяет текущий статус загруженной страницы.
+
+        Анализирует заголовок и наличие элементов Avito, чтобы
+        отличить успешную загрузку от блокировки или CloudFlare.
+
+        Returns:
+            Строка-статус:
+            - "ok" — страница Avito загружена нормально
+            - "blocked" — доступ заблокирован (403, Access Denied)
+            - "cloudflare" — CloudFlare challenge ещё не пройден
+            - "unknown" — не удалось определить статус
+        """
+        if self._page is None:
+            return "blocked"
+
+        try:
+            title = await self._page.title()
+            current_url = self._page.url
+
+            logger.debug(
+                "page_status_check",
+                title=title[:80],
+                url=current_url[:100],
+            )
+
+            # Явная блокировка по заголовку
+            blocked_titles = (
+                "Доступ ограничен",
+                "Access denied",
+                "403 Forbidden",
+                "Ошибка",
+            )
+            for phrase in blocked_titles:
+                if phrase.lower() in title.lower():
+                    return "blocked"
+
+            # CloudFlare challenge ещё активен
+            cloudflare_titles = (
+                "Just a moment",
+                "Checking your browser",
+                "Проверка браузера",
+            )
+            for phrase in cloudflare_titles:
+                if phrase.lower() in title.lower():
+                    return "cloudflare"
+
+            # Проверяем наличие реального контента Avito на странице.
+            # Ищем характерные элементы: каталог товаров, шапка сайта,
+            # поисковая строка. Если хотя бы один найден — страница ОК.
+            avito_selectors = (
+                "div[data-marker='catalog-serp']",
+                "div[data-marker='search-form']",
+                "a[data-marker='item-title']",
+                "div[class*='index-root']",
+                "input[data-marker='search-form/suggest']",
+            )
+
+            for selector in avito_selectors:
+                element = await self._page.query_selector(selector)
+                if element is not None:
+                    logger.debug(
+                        "avito_content_found",
+                        selector=selector,
+                    )
+                    return "ok"
+
+            # Если заголовок содержит "Avito" или "Авито" —
+            # скорее всего страница загрузилась, просто нет товаров
+            if "avito" in title.lower() or "авито" in title.lower():
+                logger.debug(
+                    "avito_title_found",
+                    title=title[:80],
+                )
+                return "ok"
+
+            # Ни блокировки, ни CloudFlare, ни контента Avito —
+            # возможно страница ещё грузится
+            return "unknown"
+
+        except Exception as e:
+            logger.warning(
+                "page_status_check_failed",
+                error=str(e),
+            )
+            return "unknown"
+
     async def _check_blocked(self) -> bool:
         """Проверяет, заблокирован ли доступ к странице.
 
-        Анализирует заголовок страницы и содержимое body на наличие
-        признаков блокировки или CloudFlare challenge.
+        Обёртка над _check_page_status() для обратной совместимости.
 
         Returns:
             True если обнаружена блокировка.
         """
-        if self._page is None:
-            return True
-
-        try:
-            title = await self._page.title()
-
-            if "Just a moment" in title:
-                logger.info("cloudflare_challenge_detected")
-                await asyncio.sleep(10)
-                title = await self._page.title()
-
-            blocked_titles = ("Доступ ограничен", "Access denied")
-            if any(phrase in title for phrase in blocked_titles):
-                return True
-
-            body_text = await self._page.text_content("body")
-            if body_text is None:
-                return False
-
-            blocked_keywords = (
-                "blocked",
-                "captcha",
-                "access denied",
-                "forbidden",
-            )
-            return any(
-                keyword in body_text.lower() for keyword in blocked_keywords
-            )
-
-        except Exception as e:
-            logger.warning(
-                "block_check_failed",
-                error=str(e),
-            )
-            return False
+        status = await self._check_page_status()
+        return status == "blocked"
 
     async def simulate_human_behavior(self) -> None:
         """Имитирует поведение реального пользователя на странице.

@@ -2,12 +2,13 @@
 
 Извлекает данные товаров из HTML-страниц каталога Avito,
 используя CSS-селекторы на основе data-marker атрибутов.
-Поддерживает обход пагинации и сохранение результатов
-через репозиторий.
+Поддерживает обход пагинации с retry-логикой, обнаружение
+циклов и сохранение результатов через репозиторий.
 """
 
 import asyncio
 import random
+from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import Page
 
@@ -18,18 +19,30 @@ from src.services.browser_service import BrowserService
 
 logger = get_logger("scraper_service")
 
+# Количество попыток дождаться элемента на странице
+MAX_ELEMENT_RETRIES: int = 10
+# Ожидание между попытками загрузки (секунды)
+ELEMENT_RETRY_WAIT: int = 15
+# Максимальное количество пустых страниц подряд перед остановкой
+MAX_EMPTY_PAGES: int = 2
+# Порог дубликатов товаров на странице для обнаружения цикла (%)
+DUPLICATE_THRESHOLD: float = 0.8
+
 
 class ScraperService:
     """Сервис для парсинга товаров из каталога Avito.
 
     Координирует работу BrowserService для навигации и извлекает
     структурированные данные товаров из HTML-разметки страниц.
-    Поддерживает пагинацию и батчевое сохранение через репозиторий.
+    Поддерживает пагинацию, обнаружение циклов и батчевое
+    сохранение через репозиторий.
 
     Attributes:
         _browser_service: Сервис управления браузером.
         _repository: Репозиторий для сохранения товаров.
         _settings: Настройки парсера (URL категории, лимит страниц).
+        _visited_urls: Множество посещённых URL для обнаружения циклов.
+        _seen_avito_ids: Множество уже встреченных ID товаров.
     """
 
     # CSS-селекторы для элементов каталога Avito
@@ -59,18 +72,56 @@ class ScraperService:
         self._browser_service = browser_service
         self._repository = repository
         self._settings = settings
+        self._visited_urls: set[str] = set()
+        self._seen_avito_ids: set[str] = set()
+
+    def _normalize_url_for_comparison(self, url: str) -> str:
+        """Нормализует URL для сравнения — извлекает параметр p (страница).
+
+        Два URL считаются одинаковыми, если у них совпадают путь
+        и параметр p. Остальные параметры (context, f) могут отличаться.
+
+        Args:
+            url: Полный URL страницы.
+
+        Returns:
+            Нормализованная строка для сравнения (путь + номер страницы).
+        """
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        page_num = params.get("p", ["1"])[0]
+        return f"{parsed.path}?p={page_num}"
+
+    def _extract_page_number_from_url(self, url: str) -> int:
+        """Извлекает номер страницы из параметра p в URL.
+
+        Args:
+            url: URL страницы.
+
+        Returns:
+            Номер страницы или 1, если параметр отсутствует.
+        """
+        try:
+            parsed = urlparse(url)
+            params = parse_qs(parsed.query)
+            page_str = params.get("p", ["1"])[0]
+            return int(page_str)
+        except (ValueError, IndexError):
+            return 1
 
     async def scrape_all(self) -> list[RawProduct]:
         """Парсит все страницы категории и сохраняет товары.
 
         Основной публичный метод. Запускает браузер, переходит на
         первую страницу категории, парсит товары, переходит по
-        страницам пагинации до лимита или до конца.
+        страницам пагинации до лимита, конца или обнаружения цикла.
 
         Returns:
             Полный список спарсенных товаров со всех страниц.
         """
         all_products: list[RawProduct] = []
+        self._visited_urls.clear()
+        self._seen_avito_ids.clear()
 
         page = await self._browser_service.launch()
 
@@ -84,35 +135,87 @@ class ScraperService:
             )
             return all_products
 
+        # Запоминаем начальный URL
+        initial_normalized = self._normalize_url_for_comparison(
+            self._settings.category_url
+        )
+        self._visited_urls.add(initial_normalized)
+
         await self._browser_service.simulate_human_behavior()
 
         current_page_num = 1
         max_pages = self._settings.max_pages
+        consecutive_empty_pages = 0
 
         while True:
             logger.info(
                 "scraping_page",
                 page_number=current_page_num,
+                url_page_number=self._extract_page_number_from_url(page.url),
                 max_pages=max_pages if max_pages > 0 else "unlimited",
+                total_unique_products=len(self._seen_avito_ids),
             )
 
             products = await self._parse_current_page(page)
 
             if products:
-                self._repository.save_raw_products(products)
-                all_products.extend(products)
+                # Проверяем, сколько товаров на этой странице — дубликаты
+                new_products: list[RawProduct] = []
+                duplicate_count = 0
+
+                for product in products:
+                    if product.avito_id in self._seen_avito_ids:
+                        duplicate_count += 1
+                    else:
+                        self._seen_avito_ids.add(product.avito_id)
+                        new_products.append(product)
+
+                # Обнаружение цикла: если большинство товаров — дубликаты
+                if len(products) > 0:
+                    duplicate_ratio = duplicate_count / len(products)
+                    if duplicate_ratio >= DUPLICATE_THRESHOLD:
+                        logger.warning(
+                            "pagination_cycle_detected",
+                            page_number=current_page_num,
+                            total_items=len(products),
+                            duplicates=duplicate_count,
+                            duplicate_ratio=f"{duplicate_ratio:.0%}",
+                        )
+                        # Сохраняем оставшиеся новые товары перед выходом
+                        if new_products:
+                            self._repository.save_raw_products(new_products)
+                            all_products.extend(new_products)
+                        break
+
+                if new_products:
+                    self._repository.save_raw_products(new_products)
+                    all_products.extend(new_products)
+
+                consecutive_empty_pages = 0
 
                 logger.info(
                     "page_scraped",
                     page_number=current_page_num,
                     items_on_page=len(products),
+                    new_items=len(new_products),
+                    duplicates=duplicate_count,
                     total_items=len(all_products),
                 )
             else:
+                consecutive_empty_pages += 1
                 logger.warning(
                     "no_items_on_page",
                     page_number=current_page_num,
+                    consecutive_empty=consecutive_empty_pages,
                 )
+
+                if consecutive_empty_pages >= MAX_EMPTY_PAGES:
+                    logger.warning(
+                        "too_many_empty_pages",
+                        consecutive_empty=consecutive_empty_pages,
+                        max_allowed=MAX_EMPTY_PAGES,
+                    )
+                    break
 
             if 0 < max_pages <= current_page_num:
                 logger.info(
@@ -136,15 +239,177 @@ class ScraperService:
             "scraping_completed",
             total_pages=current_page_num,
             total_items=len(all_products),
+            unique_avito_ids=len(self._seen_avito_ids),
         )
 
         return all_products
 
+    async def _scroll_page_naturally(self, page: Page) -> None:
+        """Прокручивает страницу как реальный пользователь (~10 секунд).
+
+        Последовательно прокручивает страницу вниз небольшими шагами
+        с рандомными паузами, имитируя чтение контента. Затем
+        возвращается наверх. Это помогает подгрузить lazy-loaded
+        контент и снижает риск обнаружения автоматизации.
+
+        Args:
+            page: Активная страница Playwright.
+        """
+        try:
+            # Получаем высоту страницы
+            total_height = await page.evaluate(
+                "document.body.scrollHeight"
+            )
+            viewport_height = await page.evaluate("window.innerHeight")
+
+            if total_height <= viewport_height:
+                logger.debug("page_too_short_to_scroll")
+                return
+
+            current_position = 0
+            scroll_step_min = 200
+            scroll_step_max = 500
+
+            logger.debug(
+                "scroll_started",
+                total_height=total_height,
+                viewport_height=viewport_height,
+            )
+
+            # Прокручиваем вниз с рандомными шагами
+            while current_position < total_height:
+                scroll_amount = random.randint(scroll_step_min, scroll_step_max)
+                current_position += scroll_amount
+
+                if current_position > total_height:
+                    current_position = total_height
+
+                await page.evaluate(
+                    f"window.scrollTo(0, {current_position})"
+                )
+
+                # Рандомная пауза — имитация чтения
+                pause = random.uniform(0.3, 1.2)
+                await asyncio.sleep(pause)
+
+                # Иногда небольшая прокрутка назад — как реальный человек
+                if random.random() < 0.15:
+                    back_scroll = random.randint(50, 150)
+                    current_position = max(0, current_position - back_scroll)
+                    await page.evaluate(
+                        f"window.scrollTo(0, {current_position})"
+                    )
+                    await asyncio.sleep(random.uniform(0.3, 0.7))
+
+            # Небольшая пауза внизу
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+            # Возвращаемся наверх плавно
+            await page.evaluate("window.scrollTo(0, 0)")
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+
+            logger.debug("scroll_completed")
+
+        except Exception as e:
+            logger.warning(
+                "scroll_failed",
+                error=str(e),
+            )
+
+    async def _wait_for_element_with_retry(
+        self,
+        page: Page,
+        selector: str,
+        element_name: str,
+    ) -> bool:
+        """Ожидает появления элемента на странице с повторными попытками.
+
+        При отсутствии элемента перезагружает страницу и ждёт снова.
+        Делает до MAX_ELEMENT_RETRIES попыток с ожиданием
+        ELEMENT_RETRY_WAIT секунд между ними.
+
+        Args:
+            page: Активная страница Playwright.
+            selector: CSS-селектор искомого элемента.
+            element_name: Человекочитаемое имя элемента для логов.
+
+        Returns:
+            True если элемент появился на странице.
+        """
+        for attempt in range(1, MAX_ELEMENT_RETRIES + 1):
+            try:
+                await page.wait_for_selector(
+                    selector,
+                    timeout=15000,
+                )
+                logger.info(
+                    "element_found",
+                    element=element_name,
+                    selector=selector,
+                    attempt=attempt,
+                )
+                return True
+            except Exception:
+                pass
+
+            # Элемент не найден — проверяем, не заблокированы ли мы
+            is_blocked = await self._browser_service._check_blocked()
+            if is_blocked:
+                logger.warning(
+                    "element_retry_blocked",
+                    element=element_name,
+                    attempt=attempt,
+                )
+                return False
+
+            if attempt >= MAX_ELEMENT_RETRIES:
+                logger.error(
+                    "element_retry_exhausted",
+                    element=element_name,
+                    selector=selector,
+                    attempts=MAX_ELEMENT_RETRIES,
+                    url=page.url,
+                )
+                return False
+
+            logger.warning(
+                "element_not_found_retrying",
+                element=element_name,
+                attempt=attempt,
+                max_attempts=MAX_ELEMENT_RETRIES,
+                wait_seconds=ELEMENT_RETRY_WAIT,
+                url=page.url,
+            )
+
+            # Перезагружаем текущую страницу
+            try:
+                current_url = page.url
+                await page.reload(wait_until="domcontentloaded")
+                logger.info(
+                    "page_reloaded_for_element",
+                    element=element_name,
+                    attempt=attempt,
+                    url=current_url,
+                )
+            except Exception as e:
+                logger.warning(
+                    "page_reload_failed",
+                    element=element_name,
+                    attempt=attempt,
+                    error=str(e),
+                )
+
+            # Ждём перед следующей попыткой
+            await asyncio.sleep(ELEMENT_RETRY_WAIT)
+
+        return False
+
     async def _parse_current_page(self, page: Page) -> list[RawProduct]:
         """Парсит все карточки товаров на текущей странице.
 
-        Ожидает появления контейнера каталога, затем извлекает данные
-        из каждой карточки товара.
+        Ожидает появления контейнера каталога с повторными попытками,
+        прокручивает страницу для подгрузки lazy-контента, затем
+        извлекает данные из каждой карточки.
 
         Args:
             page: Активная страница Playwright.
@@ -154,14 +419,17 @@ class ScraperService:
         """
         products: list[RawProduct] = []
 
-        try:
-            await page.wait_for_selector(
-                self.CATALOG_CONTAINER,
-                timeout=15000,
-            )
-        except Exception:
-            logger.warning("catalog_container_not_found")
+        catalog_found = await self._wait_for_element_with_retry(
+            page,
+            self.CATALOG_CONTAINER,
+            "catalog_container",
+        )
+        if not catalog_found:
+            logger.warning("catalog_container_not_found_after_retries")
             return products
+
+        # Прокручиваем страницу для подгрузки всех товаров (~10 сек)
+        await self._scroll_page_naturally(page)
 
         item_cards = await page.query_selector_all(self.ITEM_CARD)
 
@@ -169,7 +437,7 @@ class ScraperService:
             logger.warning("no_item_cards_found")
             return products
 
-        logger.debug(
+        logger.info(
             "item_cards_found",
             count=len(item_cards),
         )
@@ -320,43 +588,179 @@ class ScraperService:
             pass
         return ""
 
-    async def _go_to_next_page(self, page: Page) -> bool:
-        """Переходит на следующую страницу пагинации.
+    async def _find_next_page_url_with_retry(self, page: Page) -> str:
+        """Ищет кнопку пагинации с повторными попытками.
 
-        Ищет кнопку «Следующая страница», кликает по ней и ожидает
-        загрузки нового контента. Добавляет случайную задержку
-        для имитации человеческого поведения.
+        При отсутствии кнопки «Следующая страница» перезагружает
+        страницу и ждёт 15 секунд, до 10 попыток. Если кнопка
+        найдена — извлекает href и возвращает полный URL.
+        Проверяет, не ведёт ли ссылка на уже посещённую страницу.
 
         Args:
             page: Активная страница Playwright.
 
         Returns:
-            True если переход на следующую страницу успешен.
+            Полный URL следующей страницы или пустая строка,
+            если кнопка не найдена после всех попыток или
+            обнаружен цикл пагинации.
+        """
+        for attempt in range(1, MAX_ELEMENT_RETRIES + 1):
+            # Пытаемся найти кнопку
+            next_button = await page.query_selector(self.NEXT_PAGE_BUTTON)
+
+            if next_button is not None:
+                next_href = await next_button.get_attribute("href")
+                if next_href:
+                    # Формируем полный URL
+                    if next_href.startswith("/"):
+                        full_url = f"https://www.avito.ru{next_href}"
+                    elif next_href.startswith("http"):
+                        full_url = next_href
+                    else:
+                        full_url = f"https://www.avito.ru/{next_href}"
+
+                    # Проверяем, не посещали ли мы эту страницу
+                    normalized = self._normalize_url_for_comparison(full_url)
+                    if normalized in self._visited_urls:
+                        logger.warning(
+                            "pagination_cycle_detected_by_url",
+                            next_url=full_url[:150],
+                            normalized=normalized,
+                        )
+                        return ""
+
+                    # Запоминаем URL
+                    self._visited_urls.add(normalized)
+
+                    logger.info(
+                        "next_page_button_found",
+                        attempt=attempt,
+                        next_url=full_url[:150],
+                        page_number=self._extract_page_number_from_url(
+                            full_url
+                        ),
+                    )
+                    return full_url
+
+                logger.warning(
+                    "next_page_button_no_href",
+                    attempt=attempt,
+                )
+
+            # Кнопка не найдена — проверяем блокировку
+            is_blocked = await self._browser_service._check_blocked()
+            if is_blocked:
+                logger.warning(
+                    "pagination_retry_blocked",
+                    attempt=attempt,
+                )
+                return ""
+
+            if attempt >= MAX_ELEMENT_RETRIES:
+                logger.info(
+                    "next_page_button_not_found_after_retries",
+                    attempts=MAX_ELEMENT_RETRIES,
+                    url=page.url,
+                )
+                return ""
+
+            logger.warning(
+                "next_page_button_not_found_retrying",
+                attempt=attempt,
+                max_attempts=MAX_ELEMENT_RETRIES,
+                wait_seconds=ELEMENT_RETRY_WAIT,
+                url=page.url,
+            )
+
+            # Перезагружаем страницу
+            try:
+                current_url = page.url
+                await page.reload(wait_until="domcontentloaded")
+                logger.info(
+                    "page_reloaded_for_pagination",
+                    attempt=attempt,
+                    url=current_url,
+                )
+            except Exception as e:
+                logger.warning(
+                    "page_reload_failed_for_pagination",
+                    attempt=attempt,
+                    error=str(e),
+                )
+
+            # Ждём перед следующей попыткой
+            await asyncio.sleep(ELEMENT_RETRY_WAIT)
+
+        return ""
+
+    async def _go_to_next_page(self, page: Page) -> bool:
+        """Переходит на следующую страницу пагинации.
+
+        Ищет кнопку «Следующая страница» с retry-логикой (до 10 попыток
+        с перезагрузкой страницы). Извлекает href и переходит через
+        page.goto(). После перехода ждёт 15 секунд и проверяет
+        появление каталога с retry. Обнаруживает циклы по URL
+        и по дубликатам товаров.
+
+        Args:
+            page: Активная страница Playwright.
+
+        Returns:
+            True если переход на следующую страницу успешен и каталог найден.
         """
         try:
-            next_button = await page.query_selector(self.NEXT_PAGE_BUTTON)
-            if next_button is None:
-                logger.debug("next_page_button_not_found")
+            # Ищем URL следующей страницы с retry
+            next_url = await self._find_next_page_url_with_retry(page)
+            if not next_url:
                 return False
 
-            delay = random.uniform(1.5, 3.5)
-            logger.debug(
-                "next_page_delay",
+            # Случайная задержка перед переходом
+            delay = random.uniform(2.0, 5.0)
+            logger.info(
+                "next_page_navigating",
+                next_url=next_url[:150],
                 delay=round(delay, 1),
             )
             await asyncio.sleep(delay)
 
-            await next_button.click()
+            # Переходим на следующую страницу через goto
+            await page.goto(
+                next_url,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
 
-            await page.wait_for_load_state("domcontentloaded")
-            await asyncio.sleep(random.uniform(3, 6))
+            # Ожидание после загрузки DOM
+            logger.info(
+                "next_page_waiting",
+                wait_seconds=ELEMENT_RETRY_WAIT,
+            )
+            await asyncio.sleep(ELEMENT_RETRY_WAIT)
 
+            # Проверяем блокировку
             is_blocked = await self._browser_service._check_blocked()
             if is_blocked:
-                logger.warning("next_page_blocked")
+                logger.warning("next_page_blocked", url=next_url)
                 return False
 
-            logger.info("next_page_loaded", url=page.url)
+            # Ожидаем появления каталога с retry
+            catalog_found = await self._wait_for_element_with_retry(
+                page,
+                self.CATALOG_CONTAINER,
+                "catalog_after_pagination",
+            )
+            if not catalog_found:
+                logger.warning(
+                    "next_page_catalog_not_found",
+                    url=next_url,
+                )
+                return False
+
+            logger.info(
+                "next_page_loaded",
+                url=page.url,
+                url_page_number=self._extract_page_number_from_url(page.url),
+            )
             return True
 
         except Exception as e:
