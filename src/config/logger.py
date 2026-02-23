@@ -1,12 +1,12 @@
-"""Модуль структурированного JSON-логирования.
+"""Модуль логирования с человекочитаемым форматом.
 
-Предоставляет фабрику логгеров с JSON-форматированием,
-поддержкой trace_id для отслеживания цепочек операций
-и контекстных полей для каждого сообщения.
+Консольный вывод — понятные цветные сообщения на русском.
+Файловый вывод (опционально) — JSON для машинного анализа.
 
-Пример использования:
-    logger = get_logger("scraper_service")
-    logger.info("page_loaded", page=1, items_count=50)
+Пример вывода в консоль:
+    [09:27:36] ✅ INFO     Страница спарсена | page=5 items=50 total=250
+    [09:27:38] ⚠️  WARNING  Кнопка пагинации не найдена, перезагрузка | attempt=3
+    [09:27:40] ❌ ERROR    Ошибка AI API | status=500 retry=2/3
 """
 
 import json
@@ -19,9 +19,6 @@ from pathlib import Path
 from typing import Any
 
 
-# Контекстная переменная для хранения trace_id текущей операции.
-# Позволяет связывать логи одного запуска/операции без передачи
-# trace_id через все функции вручную.
 _trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
 
 
@@ -29,8 +26,7 @@ def set_trace_id(trace_id: str | None = None) -> str:
     """Устанавливает trace_id для текущего контекста выполнения.
 
     Args:
-        trace_id: Идентификатор трассировки. Если None — генерируется
-            автоматически (UUID4, первые 8 символов).
+        trace_id: Идентификатор трассировки. Если None — генерируется UUID4.
 
     Returns:
         Установленный trace_id.
@@ -42,34 +38,115 @@ def set_trace_id(trace_id: str | None = None) -> str:
 
 
 def get_trace_id() -> str:
-    """Возвращает trace_id текущего контекста.
-
-    Returns:
-        Текущий trace_id или пустую строку, если не установлен.
-    """
+    """Возвращает trace_id текущего контекста."""
     return _trace_id_var.get()
 
 
-class JSONFormatter(logging.Formatter):
-    """Форматирует лог-записи в JSON-формат.
+# Цвета ANSI для терминала
+class _Colors:
+    """ANSI escape-коды для цветного вывода в терминал."""
 
-    Каждая запись содержит поля:
-        - timestamp: время в ISO 8601 (UTC)
-        - level: уровень логирования
-        - message: текст сообщения
-        - trace_id: идентификатор трассировки операции
-        - logger: имя логгера (модуля)
-        - context: дополнительные поля, переданные через extra
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+
+    # Цвета текста
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+    GRAY = "\033[90m"
+
+    # Яркие цвета
+    BRIGHT_RED = "\033[91m"
+    BRIGHT_GREEN = "\033[92m"
+    BRIGHT_YELLOW = "\033[93m"
+    BRIGHT_CYAN = "\033[96m"
+
+
+# Маппинг уровней на иконки и цвета
+_LEVEL_STYLES: dict[str, tuple[str, str]] = {
+    "DEBUG":    ("🔍", _Colors.GRAY),
+    "INFO":     ("✅", _Colors.BRIGHT_GREEN),
+    "WARNING":  ("⚠️ ", _Colors.BRIGHT_YELLOW),
+    "ERROR":    ("❌", _Colors.BRIGHT_RED),
+    "CRITICAL": ("🔥", _Colors.BOLD + _Colors.BRIGHT_RED),
+}
+
+
+class HumanFormatter(logging.Formatter):
+    """Форматирует логи в человекочитаемый цветной формат для консоли.
+
+    Формат:
+        [ЧЧ:ММ:СС] 🔍 LEVEL    Сообщение | ключ=значение ключ=значение
     """
 
     def format(self, record: logging.LogRecord) -> str:
-        """Форматирует LogRecord в JSON-строку.
+        """Форматирует LogRecord в читаемую строку.
 
         Args:
-            record: Стандартная запись лога Python.
+            record: Запись лога.
 
         Returns:
-            JSON-строка с полями лога.
+            Цветная человекочитаемая строка.
+        """
+        now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        icon, color = _LEVEL_STYLES.get(
+            record.levelname, ("  ", _Colors.WHITE)
+        )
+        level = record.levelname.ljust(8)
+
+        # Основное сообщение
+        message = record.getMessage()
+
+        # Контекстные данные из kwargs
+        context_parts: list[str] = []
+        extra_data: dict[str, Any] = getattr(record, "context_data", {})
+        if extra_data:
+            for key, value in extra_data.items():
+                context_parts.append(
+                    f"{_Colors.CYAN}{key}{_Colors.RESET}="
+                    f"{_Colors.WHITE}{value}{_Colors.RESET}"
+                )
+
+        # Собираем строку
+        context_str = ""
+        if context_parts:
+            context_str = f" {_Colors.DIM}|{_Colors.RESET} " + "  ".join(
+                context_parts
+            )
+
+        # Информация об исключении
+        exc_str = ""
+        if record.exc_info and record.exc_info[1] is not None:
+            exc_type = type(record.exc_info[1]).__name__
+            exc_msg = str(record.exc_info[1])
+            exc_str = (
+                f"\n   {_Colors.RED}└─ {exc_type}: "
+                f"{exc_msg}{_Colors.RESET}"
+            )
+
+        return (
+            f"{_Colors.DIM}[{now}]{_Colors.RESET} "
+            f"{icon} {color}{level}{_Colors.RESET} "
+            f"{message}{context_str}{exc_str}"
+        )
+
+
+class JSONFileFormatter(logging.Formatter):
+    """Форматирует логи в JSON для файлового вывода."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        """Форматирует LogRecord в JSON-строку для файла.
+
+        Args:
+            record: Запись лога.
+
+        Returns:
+            JSON-строка.
         """
         log_entry: dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -79,19 +156,15 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name,
         }
 
-        # Извлекаем контекстные поля из extra
-        context: dict[str, Any] = {}
         extra_data: dict[str, Any] = getattr(record, "context_data", {})
         if extra_data:
-            context.update(extra_data)
+            log_entry["context"] = extra_data
 
-        # Добавляем информацию об исключении, если есть
         if record.exc_info and record.exc_info[1] is not None:
-            context["exception_type"] = type(record.exc_info[1]).__name__
-            context["exception_message"] = str(record.exc_info[1])
-
-        if context:
-            log_entry["context"] = context
+            log_entry["exception"] = {
+                "type": type(record.exc_info[1]).__name__,
+                "message": str(record.exc_info[1]),
+            }
 
         return json.dumps(log_entry, ensure_ascii=False, default=str)
 
@@ -99,9 +172,8 @@ class JSONFormatter(logging.Formatter):
 class ContextLogger:
     """Обёртка над стандартным логгером с поддержкой контекстных полей.
 
-    Позволяет передавать произвольные ключевые аргументы в методы
-    логирования, которые автоматически попадают в поле context
-    JSON-вывода.
+    Позволяет передавать kwargs, которые отображаются
+    как ключ=значение в конце строки лога.
 
     Attributes:
         _logger: Внутренний экземпляр стандартного логгера.
@@ -136,111 +208,71 @@ class ContextLogger:
         )
 
     def debug(self, message: str, **kwargs: Any) -> None:
-        """Лог уровня DEBUG.
-
-        Args:
-            message: Текст сообщения.
-            **kwargs: Контекстные поля.
-        """
+        """Лог уровня DEBUG."""
         self._log(logging.DEBUG, message, **kwargs)
 
     def info(self, message: str, **kwargs: Any) -> None:
-        """Лог уровня INFO.
-
-        Args:
-            message: Текст сообщения.
-            **kwargs: Контекстные поля.
-        """
+        """Лог уровня INFO."""
         self._log(logging.INFO, message, **kwargs)
 
     def warning(self, message: str, **kwargs: Any) -> None:
-        """Лог уровня WARNING.
-
-        Args:
-            message: Текст сообщения.
-            **kwargs: Контекстные поля.
-        """
+        """Лог уровня WARNING."""
         self._log(logging.WARNING, message, **kwargs)
 
-    def error(self, message: str, exc_info: bool = False, **kwargs: Any) -> None:
-        """Лог уровня ERROR.
-
-        Args:
-            message: Текст сообщения.
-            exc_info: Включать ли стек-трейс исключения.
-            **kwargs: Контекстные поля.
-        """
+    def error(
+        self, message: str, exc_info: bool = False, **kwargs: Any
+    ) -> None:
+        """Лог уровня ERROR."""
         self._log(logging.ERROR, message, exc_info=exc_info, **kwargs)
 
-    def critical(self, message: str, exc_info: bool = False, **kwargs: Any) -> None:
-        """Лог уровня CRITICAL.
-
-        Args:
-            message: Текст сообщения.
-            exc_info: Включать ли стек-трейс исключения.
-            **kwargs: Контекстные поля.
-        """
+    def critical(
+        self, message: str, exc_info: bool = False, **kwargs: Any
+    ) -> None:
+        """Лог уровня CRITICAL."""
         self._log(logging.CRITICAL, message, exc_info=exc_info, **kwargs)
 
 
-# Реестр уже созданных логгеров — предотвращает дублирование хендлеров.
 _loggers: dict[str, ContextLogger] = {}
 
 
 def setup_logging(level: str = "INFO", log_file_path: str = "") -> None:
-    """Настраивает корневую конфигурацию логирования.
+    """Настраивает логирование.
 
-    Вызывается один раз при старте приложения. Устанавливает
-    JSON-форматтер на корневой логгер, настраивает вывод в консоль
-    и опционально в файл.
+    Консоль — человекочитаемый цветной формат.
+    Файл (опционально) — JSON для машинного анализа.
 
     Args:
-        level: Уровень логирования (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+        level: Уровень логирования.
         log_file_path: Путь к файлу логов. Пустая строка — только консоль.
     """
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-
-    # Очищаем существующие хендлеры, чтобы избежать дублей при повторном вызове
     root_logger.handlers.clear()
 
-    json_formatter = JSONFormatter()
-
-    # Консольный вывод
+    # Консоль — человекочитаемый формат
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(json_formatter)
+    console_handler.setFormatter(HumanFormatter())
     root_logger.addHandler(console_handler)
 
-    # Файловый вывод (если путь задан)
+    # Файл — JSON формат (если задан путь)
     if log_file_path:
         log_path = Path(log_file_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(
             str(log_path), encoding="utf-8"
         )
-        file_handler.setFormatter(json_formatter)
+        file_handler.setFormatter(JSONFileFormatter())
         root_logger.addHandler(file_handler)
 
 
 def get_logger(name: str) -> ContextLogger:
-    """Фабрика логгеров — возвращает именованный логгер с JSON-форматом.
-
-    Каждый модуль приложения получает свой логгер по имени.
-    Повторный вызов с тем же именем возвращает тот же экземпляр.
+    """Возвращает именованный логгер.
 
     Args:
-        name: Имя логгера (например, 'scraper_service', 'ai_service').
+        name: Имя логгера (например, 'scraper', 'ai_service').
 
     Returns:
-        Экземпляр ContextLogger с поддержкой контекстных полей.
-
-    Пример:
-        logger = get_logger("scraper_service")
-        logger.info("page_loaded", page=1, items_count=50)
-        # Вывод: {"timestamp": "...", "level": "INFO",
-        #   "message": "page_loaded", "trace_id": "a1b2c3d4",
-        #   "logger": "scraper_service",
-        #   "context": {"page": 1, "items_count": 50}}
+        Экземпляр ContextLogger.
     """
     if name not in _loggers:
         stdlib_logger = logging.getLogger(name)
