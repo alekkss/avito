@@ -8,7 +8,7 @@
 
 import asyncio
 import random
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from playwright.async_api import Page
 
@@ -27,6 +27,12 @@ ELEMENT_RETRY_WAIT: int = 15
 MAX_EMPTY_PAGES: int = 2
 # Порог дубликатов товаров на странице для обнаружения цикла (%)
 DUPLICATE_THRESHOLD: float = 0.8
+# Максимальное количество попыток перехода на следующую страницу
+MAX_PAGINATION_RETRIES: int = 3
+# Количество попыток ожидания разблокировки
+MAX_UNBLOCK_RETRIES: int = 10
+# Ожидание между проверками разблокировки (секунды)
+UNBLOCK_WAIT: int = 15
 
 
 class ScraperService:
@@ -41,9 +47,10 @@ class ScraperService:
         _browser_service: Сервис управления браузером.
         _repository: Репозиторий для сохранения товаров.
         _settings: Настройки парсера (URL категории, лимит страниц).
-        _visited_urls: Множество посещённых URL для обнаружения циклов.
         _seen_avito_ids: Множество уже встреченных ID товаров.
         _total_pages: Общее количество страниц (определяется из пагинации).
+        _base_url: Базовый URL категории (без параметра p), используется
+            для конструирования URL страниц пагинации.
     """
 
     # CSS-селекторы для элементов каталога Avito
@@ -55,12 +62,6 @@ class ScraperService:
     ITEM_IMAGE = "img[itemprop='image']"
     SELLER_RATING = "[data-marker='seller-rating/score']"
     SELLER_REVIEWS = "[data-marker='seller-info/summary']"
-
-    # Селекторы пагинации — номерные кнопки вместо стрелки «Следующая»
-    PAGINATION_CONTAINER = "div[data-marker='pagination-button']"
-    PAGINATION_PAGE_BUTTON_TEMPLATE = (
-        "[data-marker='pagination-button/page({page_num})']"
-    )
 
     def __init__(
         self,
@@ -78,26 +79,9 @@ class ScraperService:
         self._browser_service = browser_service
         self._repository = repository
         self._settings = settings
-        self._visited_urls: set[str] = set()
         self._seen_avito_ids: set[str] = set()
         self._total_pages: int = 0
-
-    def _normalize_url_for_comparison(self, url: str) -> str:
-        """Нормализует URL для сравнения — извлекает параметр p (страница).
-
-        Два URL считаются одинаковыми, если у них совпадают путь
-        и параметр p. Остальные параметры (context, f) могут отличаться.
-
-        Args:
-            url: Полный URL страницы.
-
-        Returns:
-            Нормализованная строка для сравнения (путь + номер страницы).
-        """
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query)
-        page_num = params.get("p", ["1"])[0]
-        return f"{parsed.path}?p={page_num}"
+        self._base_url: str = ""
 
     def _extract_page_number_from_url(self, url: str) -> int:
         """Извлекает номер страницы из параметра p в URL.
@@ -116,6 +100,63 @@ class ScraperService:
         except (ValueError, IndexError):
             return 1
 
+    def _capture_base_url(self, url: str) -> None:
+        """Запоминает базовый URL категории после первой загрузки.
+
+        Avito может добавить дополнительные параметры (context, f)
+        при первой загрузке страницы. Мы захватываем реальный URL
+        из браузера (уже с этими параметрами) и используем его
+        как базу для конструирования URL следующих страниц.
+        Параметр p удаляется — он будет подставляться отдельно.
+
+        Args:
+            url: Реальный URL из адресной строки браузера.
+        """
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+
+        # Удаляем параметр p — будем подставлять его сами
+        params.pop("p", None)
+
+        # Собираем обратно без p
+        clean_query = urlencode(params, doseq=True)
+        self._base_url = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            clean_query,
+            "",
+        ))
+
+        logger.info(
+            "base_url_captured",
+            base_url=self._base_url[:200],
+        )
+
+    def _build_page_url(self, page_num: int) -> str:
+        """Конструирует URL для конкретной страницы пагинации.
+
+        Берёт базовый URL (захваченный из браузера после первой
+        загрузки) и добавляет параметр p=N. Для страницы 1
+        параметр p не добавляется (Avito так работает по умолчанию).
+
+        Args:
+            page_num: Номер страницы.
+
+        Returns:
+            Полный URL страницы.
+        """
+        if not self._base_url:
+            logger.error("base_url_not_captured")
+            return ""
+
+        if page_num <= 1:
+            return self._base_url
+
+        separator = "&" if "?" in self._base_url else "?"
+        return f"{self._base_url}{separator}p={page_num}"
+
     async def _detect_total_pages(self, page: Page) -> int:
         """Определяет общее количество страниц из пагинации.
 
@@ -129,7 +170,6 @@ class ScraperService:
             Номер последней страницы или 0 если пагинация не найдена.
         """
         try:
-            # Ищем все элементы с data-marker вида pagination-button/page(N)
             all_buttons = await page.query_selector_all(
                 "[data-marker^='pagination-button/page(']"
             )
@@ -142,7 +182,6 @@ class ScraperService:
             for button in all_buttons:
                 marker = await button.get_attribute("data-marker")
                 if marker:
-                    # Извлекаем число из pagination-button/page(N)
                     try:
                         start = marker.index("(") + 1
                         end = marker.index(")")
@@ -167,6 +206,79 @@ class ScraperService:
             )
             return 0
 
+    async def _wait_for_unblock(self, page: Page, context: str) -> bool:
+        """Ожидает снятия блокировки Avito с повторными попытками.
+
+        При обнаружении блокировки ждёт UNBLOCK_WAIT секунд,
+        перезагружает страницу и проверяет title снова.
+        Повторяет до MAX_UNBLOCK_RETRIES раз.
+
+        Args:
+            page: Активная страница Playwright.
+            context: Контекст вызова для логирования (например,
+                'pagination', 'element_wait').
+
+        Returns:
+            True если блокировка снята и страница загружена нормально.
+            False если после всех попыток страница всё ещё заблокирована.
+        """
+        for attempt in range(1, MAX_UNBLOCK_RETRIES + 1):
+            logger.warning(
+                "block_detected_waiting",
+                context=context,
+                attempt=attempt,
+                max_attempts=MAX_UNBLOCK_RETRIES,
+                wait_seconds=UNBLOCK_WAIT,
+            )
+
+            await asyncio.sleep(UNBLOCK_WAIT)
+
+            # Перезагружаем страницу
+            try:
+                current_url = page.url
+                await page.reload(wait_until="domcontentloaded")
+                logger.info(
+                    "page_reloaded_after_block",
+                    context=context,
+                    attempt=attempt,
+                    url=current_url[:200],
+                )
+            except Exception as e:
+                logger.warning(
+                    "page_reload_failed_after_block",
+                    context=context,
+                    attempt=attempt,
+                    error=str(e),
+                )
+                continue
+
+            # Ждём после перезагрузки, чтобы страница успела отрендериться
+            await asyncio.sleep(5)
+
+            # Проверяем, снята ли блокировка
+            is_blocked = await self._browser_service._check_blocked()
+            if not is_blocked:
+                logger.info(
+                    "block_resolved",
+                    context=context,
+                    attempt=attempt,
+                )
+                return True
+
+            logger.warning(
+                "still_blocked",
+                context=context,
+                attempt=attempt,
+            )
+
+        logger.error(
+            "block_not_resolved",
+            context=context,
+            max_attempts=MAX_UNBLOCK_RETRIES,
+            total_wait_seconds=MAX_UNBLOCK_RETRIES * UNBLOCK_WAIT,
+        )
+        return False
+
     async def scrape_all(self) -> list[RawProduct]:
         """Парсит все страницы категории и сохраняет товары.
 
@@ -178,9 +290,9 @@ class ScraperService:
             Полный список спарсенных товаров со всех страниц.
         """
         all_products: list[RawProduct] = []
-        self._visited_urls.clear()
         self._seen_avito_ids.clear()
         self._total_pages = 0
+        self._base_url = ""
 
         page = await self._browser_service.launch()
 
@@ -194,13 +306,10 @@ class ScraperService:
             )
             return all_products
 
-        # Запоминаем начальный URL
-        initial_normalized = self._normalize_url_for_comparison(
-            self._settings.category_url
-        )
-        self._visited_urls.add(initial_normalized)
-
         await self._browser_service.simulate_human_behavior()
+
+        # Захватываем базовый URL после загрузки первой страницы
+        self._capture_base_url(page.url)
 
         # Определяем общее количество страниц из пагинации
         self._total_pages = await self._detect_total_pages(page)
@@ -222,7 +331,6 @@ class ScraperService:
             products = await self._parse_current_page(page)
 
             if products:
-                # Проверяем, сколько товаров на этой странице — дубликаты
                 new_products: list[RawProduct] = []
                 duplicate_count = 0
 
@@ -244,7 +352,6 @@ class ScraperService:
                             duplicates=duplicate_count,
                             duplicate_ratio=f"{duplicate_ratio:.0%}",
                         )
-                        # Сохраняем оставшиеся новые товары перед выходом
                         if new_products:
                             self._repository.save_raw_products(new_products)
                             all_products.extend(new_products)
@@ -334,7 +441,6 @@ class ScraperService:
             page: Активная страница Playwright.
         """
         try:
-            # Получаем высоту страницы
             total_height = await page.evaluate(
                 "document.body.scrollHeight"
             )
@@ -354,7 +460,6 @@ class ScraperService:
                 viewport_height=viewport_height,
             )
 
-            # Прокручиваем вниз с рандомными шагами
             while current_position < total_height:
                 scroll_amount = random.randint(scroll_step_min, scroll_step_max)
                 current_position += scroll_amount
@@ -366,11 +471,9 @@ class ScraperService:
                     f"window.scrollTo(0, {current_position})"
                 )
 
-                # Рандомная пауза — имитация чтения
                 pause = random.uniform(0.3, 1.2)
                 await asyncio.sleep(pause)
 
-                # Иногда небольшая прокрутка назад — как реальный человек
                 if random.random() < 0.15:
                     back_scroll = random.randint(50, 150)
                     current_position = max(0, current_position - back_scroll)
@@ -379,10 +482,8 @@ class ScraperService:
                     )
                     await asyncio.sleep(random.uniform(0.3, 0.7))
 
-            # Небольшая пауза внизу
             await asyncio.sleep(random.uniform(0.5, 1.5))
 
-            # Возвращаемся наверх плавно
             await page.evaluate("window.scrollTo(0, 0)")
             await asyncio.sleep(random.uniform(0.5, 1.0))
 
@@ -402,9 +503,11 @@ class ScraperService:
     ) -> bool:
         """Ожидает появления элемента на странице с повторными попытками.
 
-        При отсутствии элемента перезагружает страницу и ждёт снова.
-        Делает до MAX_ELEMENT_RETRIES попыток с ожиданием
-        ELEMENT_RETRY_WAIT секунд между ними.
+        При отсутствии элемента проверяет блокировку. Если страница
+        заблокирована — запускает цикл ожидания разблокировки
+        (до MAX_UNBLOCK_RETRIES попыток с перезагрузкой).
+        Если не заблокирована — перезагружает страницу и ждёт снова.
+        Делает до MAX_ELEMENT_RETRIES общих попыток.
 
         Args:
             page: Активная страница Playwright.
@@ -430,14 +533,19 @@ class ScraperService:
             except Exception:
                 pass
 
-            # Элемент не найден — проверяем, не заблокированы ли мы
+            # Элемент не найден — проверяем блокировку
             is_blocked = await self._browser_service._check_blocked()
             if is_blocked:
-                logger.warning(
-                    "element_retry_blocked",
-                    element=element_name,
-                    attempt=attempt,
+                # Запускаем цикл ожидания разблокировки
+                unblocked = await self._wait_for_unblock(
+                    page,
+                    context=f"element_wait:{element_name}",
                 )
+                if unblocked:
+                    # Блокировка снята — пробуем найти элемент снова
+                    # (не тратим попытку, просто продолжаем цикл)
+                    continue
+                # Блокировка не снята после всех попыток
                 return False
 
             if attempt >= MAX_ELEMENT_RETRIES:
@@ -477,7 +585,6 @@ class ScraperService:
                     error=str(e),
                 )
 
-            # Ждём перед следующей попыткой
             await asyncio.sleep(ELEMENT_RETRY_WAIT)
 
         return False
@@ -506,7 +613,6 @@ class ScraperService:
             logger.warning("catalog_container_not_found_after_retries")
             return products
 
-        # Прокручиваем страницу для подгрузки всех товаров (~10 сек)
         await self._scroll_page_naturally(page)
 
         item_cards = await page.query_selector_all(self.ITEM_CARD)
@@ -548,13 +654,11 @@ class ScraperService:
         Returns:
             RawProduct с данными товара или None если не удалось распарсить.
         """
-        # Извлекаем avito_id из атрибута data-item-id
         avito_id = await card.get_attribute("data-item-id")
         if not avito_id:
             logger.debug("card_missing_avito_id")
             return None
 
-        # Название и URL из ссылки заголовка
         title = ""
         url = ""
         title_element = await card.query_selector(self.ITEM_TITLE)
@@ -566,7 +670,6 @@ class ScraperService:
             logger.debug("card_missing_title", avito_id=avito_id)
             return None
 
-        # Цена из meta-тега
         price = 0
         price_meta = await card.query_selector(self.ITEM_PRICE_META)
         if price_meta:
@@ -580,19 +683,16 @@ class ScraperService:
                     price_str=price_str,
                 )
 
-        # Описание из meta-тега
         description = ""
         desc_meta = await card.query_selector(self.ITEM_DESCRIPTION)
         if desc_meta:
             description = await desc_meta.get_attribute("content") or ""
 
-        # URL первого изображения
         image_url = ""
         img_element = await card.query_selector(self.ITEM_IMAGE)
         if img_element:
             image_url = await img_element.get_attribute("src") or ""
 
-        # Информация о продавце
         seller_name = await self._extract_seller_name(card)
         seller_rating = await self._extract_text_by_selector(
             card, self.SELLER_RATING
@@ -666,401 +766,195 @@ class ScraperService:
             pass
         return ""
 
-    def _build_page_button_selector(self, page_num: int) -> str:
-        """Формирует CSS-селектор для номерной кнопки пагинации.
-
-        Args:
-            page_num: Номер страницы.
-
-        Returns:
-            CSS-селектор вида [data-marker='pagination-button/page(N)'].
-        """
-        return f"[data-marker='pagination-button/page({page_num})']"
-
-    async def _find_target_page_button(
-        self, page: Page, target_page_num: int
-    ) -> str:
-        """Ищет кнопку конкретной страницы в пагинации и возвращает URL.
-
-        Кнопка может быть элементом <a> (со ссылкой) или <span>
-        (текущая страница без ссылки). Метод ищет только <a>-кнопки,
-        потому что нам нужен href для перехода.
-
-        Args:
-            page: Активная страница Playwright.
-            target_page_num: Номер страницы, на которую нужно перейти.
-
-        Returns:
-            Полный URL целевой страницы или пустая строка если не найдена.
-        """
-        selector = self._build_page_button_selector(target_page_num)
-
-        button = await page.query_selector(selector)
-        if button is None:
-            return ""
-
-        # Проверяем тег — нам нужен <a> с href
-        tag_name = await button.evaluate("el => el.tagName.toLowerCase()")
-        if tag_name != "a":
-            logger.debug(
-                "page_button_not_a_link",
-                target_page=target_page_num,
-                tag=tag_name,
-            )
-            return ""
-
-        href = await button.get_attribute("href")
-        if not href:
-            return ""
-
-        # Формируем полный URL
-        if href.startswith("/"):
-            return f"https://www.avito.ru{href}"
-        if href.startswith("http"):
-            return href
-        return f"https://www.avito.ru/{href}"
-
-    async def _navigate_pagination_window(
-        self, page: Page, target_page_num: int
-    ) -> str:
-        """Сдвигает окно пагинации, чтобы добраться до нужной кнопки.
-
-        Если кнопка целевой страницы не видна в текущем окне пагинации
-        (например, мы на странице 1, а нужна страница 15), метод
-        кликает по ближайшей видимой кнопке с большим номером,
-        чтобы сдвинуть окно. Повторяет до тех пор, пока целевая
-        кнопка не появится или не останется вариантов.
-
-        Args:
-            page: Активная страница Playwright.
-            target_page_num: Номер страницы, на которую нужно перейти.
-
-        Returns:
-            Полный URL целевой страницы или пустая строка если
-            не удалось добраться до нужной кнопки.
-        """
-        max_shifts = 20
-        for shift in range(1, max_shifts + 1):
-            # Сначала проверяем — может кнопка уже видна
-            target_url = await self._find_target_page_button(
-                page, target_page_num
-            )
-            if target_url:
-                return target_url
-
-            # Кнопка не видна — ищем ближайшую видимую кнопку
-            # с номером больше текущей, но меньше целевой
-            best_button_num = 0
-            best_button_url = ""
-
-            all_buttons = await page.query_selector_all(
-                "[data-marker^='pagination-button/page(']"
-            )
-
-            for button in all_buttons:
-                marker = await button.get_attribute("data-marker")
-                if not marker:
-                    continue
-
-                try:
-                    start = marker.index("(") + 1
-                    end = marker.index(")")
-                    num = int(marker[start:end])
-                except (ValueError, IndexError):
-                    continue
-
-                # Ищем кнопку, которая ближе всего к целевой, но меньше её
-                if num > best_button_num and num < target_page_num:
-                    tag_name = await button.evaluate(
-                        "el => el.tagName.toLowerCase()"
-                    )
-                    if tag_name == "a":
-                        href = await button.get_attribute("href")
-                        if href:
-                            best_button_num = num
-                            if href.startswith("/"):
-                                best_button_url = (
-                                    f"https://www.avito.ru{href}"
-                                )
-                            elif href.startswith("http"):
-                                best_button_url = href
-                            else:
-                                best_button_url = (
-                                    f"https://www.avito.ru/{href}"
-                                )
-
-            if not best_button_url:
-                logger.warning(
-                    "no_intermediate_page_button",
-                    target_page=target_page_num,
-                    shift_attempt=shift,
-                )
-                return ""
-
-            logger.info(
-                "pagination_window_shift",
-                shift_attempt=shift,
-                intermediate_page=best_button_num,
-                target_page=target_page_num,
-            )
-
-            # Переходим на промежуточную страницу, чтобы сдвинуть окно
-            delay = random.uniform(1.5, 3.0)
-            await asyncio.sleep(delay)
-
-            try:
-                await page.goto(
-                    best_button_url,
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-            except Exception as e:
-                logger.warning(
-                    "pagination_shift_navigation_failed",
-                    intermediate_page=best_button_num,
-                    error=str(e),
-                )
-                return ""
-
-            await asyncio.sleep(ELEMENT_RETRY_WAIT)
-
-            # Проверяем блокировку
-            is_blocked = await self._browser_service._check_blocked()
-            if is_blocked:
-                logger.warning(
-                    "pagination_shift_blocked",
-                    intermediate_page=best_button_num,
-                )
-                return ""
-
-            # Ждём каталог
-            catalog_found = await self._wait_for_element_with_retry(
-                page,
-                self.CATALOG_CONTAINER,
-                "catalog_after_shift",
-            )
-            if not catalog_found:
-                logger.warning(
-                    "catalog_not_found_after_shift",
-                    intermediate_page=best_button_num,
-                )
-                return ""
-
-        logger.warning(
-            "pagination_window_shift_exhausted",
-            target_page=target_page_num,
-            max_shifts=max_shifts,
-        )
-        return ""
-
-    async def _find_next_page_url_with_retry(
-        self, page: Page, current_page_num: int
-    ) -> str:
-        """Находит URL следующей страницы по номерной кнопке пагинации.
-
-        Стратегия:
-        1. Ищем кнопку page(current + 1) на текущей странице.
-        2. Если кнопка не видна — сдвигаем окно пагинации,
-           кликая по ближайшей промежуточной кнопке.
-        3. При неудаче — retry с перезагрузкой страницы.
-
-        Args:
-            page: Активная страница Playwright.
-            current_page_num: Номер текущей страницы.
-
-        Returns:
-            Полный URL следующей страницы или пустая строка.
-        """
-        target_page_num = current_page_num + 1
-
-        for attempt in range(1, MAX_ELEMENT_RETRIES + 1):
-            # Шаг 1: Ищем кнопку целевой страницы напрямую
-            target_url = await self._find_target_page_button(
-                page, target_page_num
-            )
-
-            if target_url:
-                # Проверяем, не посещали ли мы эту страницу
-                normalized = self._normalize_url_for_comparison(target_url)
-                if normalized in self._visited_urls:
-                    logger.warning(
-                        "pagination_cycle_detected_by_url",
-                        target_page=target_page_num,
-                        normalized=normalized,
-                    )
-                    return ""
-
-                self._visited_urls.add(normalized)
-
-                logger.info(
-                    "next_page_button_found",
-                    attempt=attempt,
-                    target_page=target_page_num,
-                    next_url=target_url[:150],
-                )
-                return target_url
-
-            # Шаг 2: Кнопка не видна — пробуем сдвинуть окно пагинации
-            logger.debug(
-                "target_page_not_visible",
-                target_page=target_page_num,
-                attempt=attempt,
-            )
-
-            shifted_url = await self._navigate_pagination_window(
-                page, target_page_num
-            )
-            if shifted_url:
-                normalized = self._normalize_url_for_comparison(shifted_url)
-                if normalized in self._visited_urls:
-                    logger.warning(
-                        "pagination_cycle_detected_by_url_after_shift",
-                        target_page=target_page_num,
-                        normalized=normalized,
-                    )
-                    return ""
-
-                self._visited_urls.add(normalized)
-
-                logger.info(
-                    "next_page_found_after_shift",
-                    attempt=attempt,
-                    target_page=target_page_num,
-                    next_url=shifted_url[:150],
-                )
-                return shifted_url
-
-            # Шаг 3: Не удалось — проверяем блокировку
-            is_blocked = await self._browser_service._check_blocked()
-            if is_blocked:
-                logger.warning(
-                    "pagination_retry_blocked",
-                    attempt=attempt,
-                )
-                return ""
-
-            if attempt >= MAX_ELEMENT_RETRIES:
-                logger.info(
-                    "next_page_button_not_found_after_retries",
-                    target_page=target_page_num,
-                    attempts=MAX_ELEMENT_RETRIES,
-                    url=page.url,
-                )
-                return ""
-
-            logger.warning(
-                "next_page_button_not_found_retrying",
-                target_page=target_page_num,
-                attempt=attempt,
-                max_attempts=MAX_ELEMENT_RETRIES,
-                wait_seconds=ELEMENT_RETRY_WAIT,
-                url=page.url,
-            )
-
-            # Перезагружаем страницу
-            try:
-                current_url = page.url
-                await page.reload(wait_until="domcontentloaded")
-                logger.info(
-                    "page_reloaded_for_pagination",
-                    attempt=attempt,
-                    url=current_url,
-                )
-            except Exception as e:
-                logger.warning(
-                    "page_reload_failed_for_pagination",
-                    attempt=attempt,
-                    error=str(e),
-                )
-
-            await asyncio.sleep(ELEMENT_RETRY_WAIT)
-
-        return ""
-
     async def _go_to_next_page(
         self, page: Page, current_page_num: int
     ) -> bool:
-        """Переходит на следующую страницу пагинации по номерной кнопке.
+        """Переходит на следующую страницу пагинации.
 
-        Ищет кнопку page(current + 1) с retry-логикой. Если кнопка
-        не видна в текущем окне пагинации — сдвигает окно через
-        промежуточные переходы. После перехода ждёт загрузки каталога.
+        Конструирует URL следующей страницы самостоятельно, подставляя
+        параметр p=N в базовый URL. После перехода валидирует, что
+        загруженная страница соответствует ожидаемому номеру.
+
+        При обнаружении блокировки запускает цикл ожидания
+        разблокировки (до MAX_UNBLOCK_RETRIES попыток с перезагрузкой)
+        вместо немедленного завершения.
 
         Args:
             page: Активная страница Playwright.
             current_page_num: Номер текущей страницы.
 
         Returns:
-            True если переход на следующую страницу успешен.
+            True если переход на следующую страницу успешен и валиден.
         """
-        try:
-            target_page_num = current_page_num + 1
+        target_page_num = current_page_num + 1
 
-            # Ищем URL следующей страницы
-            next_url = await self._find_next_page_url_with_retry(
-                page, current_page_num
-            )
-            if not next_url:
-                return False
-
-            # Случайная задержка перед переходом
-            delay = random.uniform(2.0, 5.0)
-            logger.info(
-                "next_page_navigating",
-                target_page=target_page_num,
-                next_url=next_url[:150],
-                delay=round(delay, 1),
-            )
-            await asyncio.sleep(delay)
-
-            # Переходим на следующую страницу
-            await page.goto(
-                next_url,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-
-            # Ожидание после загрузки DOM
-            logger.info(
-                "next_page_waiting",
-                wait_seconds=ELEMENT_RETRY_WAIT,
-            )
-            await asyncio.sleep(ELEMENT_RETRY_WAIT)
-
-            # Проверяем блокировку
-            is_blocked = await self._browser_service._check_blocked()
-            if is_blocked:
-                logger.warning(
-                    "next_page_blocked",
-                    url=next_url,
-                )
-                return False
-
-            # Ожидаем появления каталога с retry
-            catalog_found = await self._wait_for_element_with_retry(
-                page,
-                self.CATALOG_CONTAINER,
-                "catalog_after_pagination",
-            )
-            if not catalog_found:
-                logger.warning(
-                    "next_page_catalog_not_found",
-                    url=next_url,
-                )
-                return False
-
-            logger.info(
-                "next_page_loaded",
-                target_page=target_page_num,
-                url=page.url,
-                url_page_number=self._extract_page_number_from_url(page.url),
-            )
-            return True
-
-        except Exception as e:
+        next_url = self._build_page_url(target_page_num)
+        if not next_url:
             logger.error(
-                "next_page_navigation_failed",
-                exc_info=True,
-                error=str(e),
+                "cannot_build_next_page_url",
+                target_page=target_page_num,
             )
             return False
+
+        logger.info(
+            "next_page_url_constructed",
+            target_page=target_page_num,
+            next_url=next_url[:200],
+        )
+
+        for attempt in range(1, MAX_PAGINATION_RETRIES + 1):
+            try:
+                # Случайная задержка перед переходом
+                delay = random.uniform(2.0, 5.0)
+                logger.info(
+                    "next_page_navigating",
+                    target_page=target_page_num,
+                    attempt=attempt,
+                    delay=round(delay, 1),
+                )
+                await asyncio.sleep(delay)
+
+                # Переходим на сконструированный URL
+                await page.goto(
+                    next_url,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+
+                # Ожидание после загрузки DOM
+                logger.info(
+                    "next_page_waiting",
+                    wait_seconds=ELEMENT_RETRY_WAIT,
+                )
+                await asyncio.sleep(ELEMENT_RETRY_WAIT)
+
+                # Проверяем блокировку — с ожиданием разблокировки
+                is_blocked = await self._browser_service._check_blocked()
+                if is_blocked:
+                    unblocked = await self._wait_for_unblock(
+                        page,
+                        context=f"pagination:page_{target_page_num}",
+                    )
+                    if not unblocked:
+                        # После всех попыток всё ещё заблокированы
+                        logger.error(
+                            "next_page_permanently_blocked",
+                            target_page=target_page_num,
+                        )
+                        return False
+
+                    # Блокировка снята — нужно снова перейти на целевую страницу,
+                    # потому что reload мог загрузить страницу блокировки
+                    logger.info(
+                        "retrying_navigation_after_unblock",
+                        target_page=target_page_num,
+                    )
+                    try:
+                        await page.goto(
+                            next_url,
+                            wait_until="domcontentloaded",
+                            timeout=60000,
+                        )
+                        await asyncio.sleep(ELEMENT_RETRY_WAIT)
+                    except Exception as e:
+                        logger.warning(
+                            "navigation_after_unblock_failed",
+                            target_page=target_page_num,
+                            error=str(e),
+                        )
+                        if attempt < MAX_PAGINATION_RETRIES:
+                            continue
+                        return False
+
+                    # Проверяем блокировку ещё раз после повторного перехода
+                    still_blocked = await self._browser_service._check_blocked()
+                    if still_blocked:
+                        logger.warning(
+                            "blocked_again_after_retry_navigation",
+                            target_page=target_page_num,
+                        )
+                        if attempt < MAX_PAGINATION_RETRIES:
+                            continue
+                        return False
+
+                # Ожидаем появления каталога
+                catalog_found = await self._wait_for_element_with_retry(
+                    page,
+                    self.CATALOG_CONTAINER,
+                    "catalog_after_pagination",
+                )
+                if not catalog_found:
+                    logger.warning(
+                        "next_page_catalog_not_found",
+                        target_page=target_page_num,
+                        attempt=attempt,
+                    )
+                    if attempt < MAX_PAGINATION_RETRIES:
+                        continue
+                    return False
+
+                # ВАЛИДАЦИЯ: проверяем, что реальный URL соответствует
+                # ожидаемому номеру страницы
+                actual_page_num = self._extract_page_number_from_url(page.url)
+
+                if actual_page_num == target_page_num:
+                    logger.info(
+                        "next_page_loaded",
+                        target_page=target_page_num,
+                        actual_page=actual_page_num,
+                        url=page.url[:200],
+                    )
+                    return True
+
+                # Avito сбросил на другую страницу
+                logger.warning(
+                    "page_number_mismatch",
+                    target_page=target_page_num,
+                    actual_page=actual_page_num,
+                    attempt=attempt,
+                    url=page.url[:200],
+                )
+
+                if actual_page_num == 1:
+                    logger.warning(
+                        "avito_pagination_limit_reached",
+                        last_successful_page=current_page_num,
+                        attempted_page=target_page_num,
+                    )
+                    fallback_url = self._build_page_url(current_page_num)
+                    if fallback_url:
+                        try:
+                            await page.goto(
+                                fallback_url,
+                                wait_until="domcontentloaded",
+                                timeout=60000,
+                            )
+                        except Exception:
+                            pass
+                    return False
+
+                if attempt < MAX_PAGINATION_RETRIES:
+                    logger.info(
+                        "retrying_page_navigation",
+                        target_page=target_page_num,
+                        attempt=attempt,
+                    )
+                    continue
+
+                return False
+
+            except Exception as e:
+                logger.error(
+                    "next_page_navigation_failed",
+                    target_page=target_page_num,
+                    attempt=attempt,
+                    error=str(e),
+                )
+
+                if attempt < MAX_PAGINATION_RETRIES:
+                    await asyncio.sleep(ELEMENT_RETRY_WAIT)
+                    continue
+
+                return False
+
+        return False
