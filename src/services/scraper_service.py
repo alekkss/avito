@@ -33,6 +33,11 @@ MAX_PAGINATION_RETRIES: int = 3
 MAX_UNBLOCK_RETRIES: int = 10
 # Ожидание между проверками разблокировки (секунды)
 UNBLOCK_WAIT: int = 15
+# Максимальное количество попыток первоначальной навигации
+MAX_INITIAL_NAVIGATION_RETRIES: int = 5
+# Таймаут ожидания контейнера после пагинации (мс)
+# Короткий таймаут: если контейнера нет — товары закончились
+PAGINATION_CONTAINER_TIMEOUT: int = 15000
 
 
 class ScraperService:
@@ -54,7 +59,8 @@ class ScraperService:
     """
 
     # CSS-селекторы для элементов каталога Avito
-    CATALOG_CONTAINER = "div[data-marker='catalog-serp']"
+    # Основной контейнер с объявлениями — ищем карточки только внутри него
+    CATALOG_CONTAINER = "div#bx_serp-item-list"
     ITEM_CARD = "div[data-marker='item']"
     ITEM_TITLE = "a[data-marker='item-title']"
     ITEM_PRICE_META = "meta[itemprop='price']"
@@ -279,12 +285,180 @@ class ScraperService:
         )
         return False
 
+    async def _initial_navigate_with_retry(self, page: Page) -> bool:
+        """Выполняет первоначальную навигацию с ожиданием разблокировки.
+
+        При блокировке на первой странице запускает цикл ожидания
+        разблокировки и повторяет навигацию. Это позволяет пользователю
+        решить CAPTCHA вручную в открытом окне браузера.
+
+        Args:
+            page: Активная страница Playwright.
+
+        Returns:
+            True если навигация успешна после всех попыток.
+        """
+        url = self._settings.category_url
+
+        # Первая попытка навигации
+        success = await self._browser_service.navigate(url)
+        if success:
+            return True
+
+        # Навигация не удалась — проверяем, блокировка ли это
+        is_blocked = await self._browser_service._check_blocked()
+        if not is_blocked:
+            # Не блокировка, а другая ошибка — повторять бессмысленно
+            logger.error(
+                "initial_navigation_failed_not_blocked",
+                url=url,
+            )
+            return False
+
+        # Блокировка — запускаем цикл ожидания разблокировки
+        logger.warning(
+            "initial_navigation_blocked",
+            url=url,
+        )
+
+        unblocked = await self._wait_for_unblock(
+            page,
+            context="initial_navigation",
+        )
+        if not unblocked:
+            logger.error(
+                "initial_navigation_block_not_resolved",
+                url=url,
+                max_attempts=MAX_UNBLOCK_RETRIES,
+            )
+            return False
+
+        # Блокировка снята — повторяем навигацию
+        for attempt in range(1, MAX_INITIAL_NAVIGATION_RETRIES + 1):
+            logger.info(
+                "initial_navigation_retry",
+                attempt=attempt,
+                max_attempts=MAX_INITIAL_NAVIGATION_RETRIES,
+                url=url,
+            )
+
+            success = await self._browser_service.navigate(url)
+            if success:
+                logger.info(
+                    "initial_navigation_retry_success",
+                    attempt=attempt,
+                )
+                return True
+
+            # Опять блокировка?
+            is_blocked = await self._browser_service._check_blocked()
+            if is_blocked:
+                unblocked = await self._wait_for_unblock(
+                    page,
+                    context=f"initial_navigation_retry:{attempt}",
+                )
+                if not unblocked:
+                    logger.error(
+                        "initial_navigation_permanently_blocked",
+                        attempt=attempt,
+                    )
+                    return False
+            else:
+                # Не блокировка — какая-то другая ошибка
+                logger.error(
+                    "initial_navigation_retry_failed",
+                    attempt=attempt,
+                    url=url,
+                )
+                if attempt < MAX_INITIAL_NAVIGATION_RETRIES:
+                    await asyncio.sleep(ELEMENT_RETRY_WAIT)
+                    continue
+                return False
+
+        logger.error(
+            "initial_navigation_all_retries_exhausted",
+            max_attempts=MAX_INITIAL_NAVIGATION_RETRIES,
+            url=url,
+        )
+        return False
+
+    async def _check_container_after_pagination(
+        self, page: Page, target_page_num: int
+    ) -> bool:
+        """Проверяет наличие контейнера с товарами после пагинации.
+
+        В отличие от _wait_for_element_with_retry (который делает
+        до 10 попыток с перезагрузками), этот метод выполняет
+        однократную быструю проверку. Если контейнер не найден —
+        это означает, что товары закончились, а не ошибку загрузки.
+
+        При обнаружении блокировки — запускает ожидание разблокировки.
+
+        Args:
+            page: Активная страница Playwright.
+            target_page_num: Номер целевой страницы (для логов).
+
+        Returns:
+            True если контейнер с товарами найден на странице.
+        """
+        try:
+            await page.wait_for_selector(
+                self.CATALOG_CONTAINER,
+                timeout=PAGINATION_CONTAINER_TIMEOUT,
+            )
+            logger.info(
+                "pagination_container_found",
+                target_page=target_page_num,
+                container=self.CATALOG_CONTAINER,
+            )
+            return True
+        except Exception:
+            pass
+
+        # Контейнер не найден — проверяем, блокировка ли это
+        is_blocked = await self._browser_service._check_blocked()
+        if is_blocked:
+            logger.warning(
+                "pagination_page_blocked",
+                target_page=target_page_num,
+            )
+            unblocked = await self._wait_for_unblock(
+                page,
+                context=f"pagination_container:page_{target_page_num}",
+            )
+            if unblocked:
+                # После разблокировки пробуем найти контейнер ещё раз
+                try:
+                    await page.wait_for_selector(
+                        self.CATALOG_CONTAINER,
+                        timeout=PAGINATION_CONTAINER_TIMEOUT,
+                    )
+                    logger.info(
+                        "pagination_container_found_after_unblock",
+                        target_page=target_page_num,
+                    )
+                    return True
+                except Exception:
+                    pass
+
+            # Блокировка не снята или контейнер всё равно не найден
+            return False
+
+        # Не блокировка — значит товары просто закончились
+        logger.info(
+            "pagination_no_more_items",
+            target_page=target_page_num,
+            container=self.CATALOG_CONTAINER,
+        )
+        return False
+
     async def scrape_all(self) -> list[RawProduct]:
         """Парсит все страницы категории и сохраняет товары.
 
         Основной публичный метод. Запускает браузер, переходит на
-        первую страницу категории, парсит товары, переходит по
-        страницам пагинации до лимита, конца или обнаружения цикла.
+        первую страницу категории с ожиданием разблокировки,
+        парсит товары, переходит по страницам пагинации до лимита,
+        конца или обнаружения цикла.
 
         Returns:
             Полный список спарсенных товаров со всех страниц.
@@ -296,9 +470,8 @@ class ScraperService:
 
         page = await self._browser_service.launch()
 
-        success = await self._browser_service.navigate(
-            self._settings.category_url
-        )
+        # Первоначальная навигация с ожиданием разблокировки
+        success = await self._initial_navigate_with_retry(page)
         if not success:
             logger.error(
                 "initial_navigation_failed",
@@ -590,20 +763,22 @@ class ScraperService:
         return False
 
     async def _parse_current_page(self, page: Page) -> list[RawProduct]:
-        """Парсит все карточки товаров на текущей странице.
+        """Парсит карточки товаров на текущей странице.
 
-        Ожидает появления контейнера каталога с повторными попытками,
-        прокручивает страницу для подгрузки lazy-контента, затем
-        извлекает данные из каждой карточки.
+        Ожидает появления контейнера div#bx_serp-item-list с повторными
+        попытками, прокручивает страницу для подгрузки lazy-контента,
+        затем извлекает данные из каждой карточки, находящейся
+        строго внутри этого контейнера.
 
         Args:
             page: Активная страница Playwright.
 
         Returns:
-            Список товаров, извлечённых с текущей страницы.
+            Список товаров, извлечённых из контейнера на текущей странице.
         """
         products: list[RawProduct] = []
 
+        # Ожидаем появления основного контейнера с объявлениями
         catalog_found = await self._wait_for_element_with_retry(
             page,
             self.CATALOG_CONTAINER,
@@ -615,15 +790,29 @@ class ScraperService:
 
         await self._scroll_page_naturally(page)
 
-        item_cards = await page.query_selector_all(self.ITEM_CARD)
+        # Находим сам контейнер div#bx_serp-item-list
+        container = await page.query_selector(self.CATALOG_CONTAINER)
+        if not container:
+            logger.warning(
+                "catalog_container_disappeared_after_scroll",
+                selector=self.CATALOG_CONTAINER,
+            )
+            return products
+
+        # Ищем карточки товаров ТОЛЬКО внутри контейнера
+        item_cards = await container.query_selector_all(self.ITEM_CARD)
 
         if not item_cards:
-            logger.warning("no_item_cards_found")
+            logger.warning(
+                "no_item_cards_in_container",
+                container=self.CATALOG_CONTAINER,
+            )
             return products
 
         logger.info(
             "item_cards_found",
             count=len(item_cards),
+            container=self.CATALOG_CONTAINER,
         )
 
         for card in item_cards:
@@ -772,12 +961,13 @@ class ScraperService:
         """Переходит на следующую страницу пагинации.
 
         Конструирует URL следующей страницы самостоятельно, подставляя
-        параметр p=N в базовый URL. После перехода валидирует, что
-        загруженная страница соответствует ожидаемому номеру.
+        параметр p=N в базовый URL. После перехода выполняет быструю
+        проверку наличия контейнера с товарами. Если контейнер не
+        найден и страница не заблокирована — это означает конец
+        пагинации (товары закончились), а не ошибку загрузки.
 
         При обнаружении блокировки запускает цикл ожидания
-        разблокировки (до MAX_UNBLOCK_RETRIES попыток с перезагрузкой)
-        вместо немедленного завершения.
+        разблокировки (до MAX_UNBLOCK_RETRIES попыток с перезагрузкой).
 
         Args:
             page: Активная страница Playwright.
@@ -836,15 +1026,13 @@ class ScraperService:
                         context=f"pagination:page_{target_page_num}",
                     )
                     if not unblocked:
-                        # После всех попыток всё ещё заблокированы
                         logger.error(
                             "next_page_permanently_blocked",
                             target_page=target_page_num,
                         )
                         return False
 
-                    # Блокировка снята — нужно снова перейти на целевую страницу,
-                    # потому что reload мог загрузить страницу блокировки
+                    # Блокировка снята — повторяем переход на целевую страницу
                     logger.info(
                         "retrying_navigation_after_unblock",
                         target_page=target_page_num,
@@ -866,7 +1054,7 @@ class ScraperService:
                             continue
                         return False
 
-                    # Проверяем блокировку ещё раз после повторного перехода
+                    # Проверяем блокировку ещё раз
                     still_blocked = await self._browser_service._check_blocked()
                     if still_blocked:
                         logger.warning(
@@ -877,20 +1065,13 @@ class ScraperService:
                             continue
                         return False
 
-                # Ожидаем появления каталога
-                catalog_found = await self._wait_for_element_with_retry(
-                    page,
-                    self.CATALOG_CONTAINER,
-                    "catalog_after_pagination",
+                # Быстрая проверка наличия контейнера с товарами.
+                # Если контейнера нет и нет блокировки — товары закончились.
+                container_found = await self._check_container_after_pagination(
+                    page, target_page_num
                 )
-                if not catalog_found:
-                    logger.warning(
-                        "next_page_catalog_not_found",
-                        target_page=target_page_num,
-                        attempt=attempt,
-                    )
-                    if attempt < MAX_PAGINATION_RETRIES:
-                        continue
+                if not container_found:
+                    # Метод уже залогировал причину (блокировка или конец товаров)
                     return False
 
                 # ВАЛИДАЦИЯ: проверяем, что реальный URL соответствует
