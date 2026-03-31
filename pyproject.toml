@@ -7,8 +7,8 @@ build-backend = "setuptools.build_meta"
 # ============================================
 [project]
 name = "avito-parser"
-version = "1.0.0"
-description = "Парсер товаров Avito с AI-нормализацией названий и экспортом в Excel"
+version = "2.0.0"
+description = "Парсер объявлений краткосрочной аренды Avito с экспортом в Excel"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -19,7 +19,6 @@ license = {text = "MIT"}
 dependencies = [
     "playwright>=1.40.0",
     "python-dotenv>=1.0.0",
-    "aiohttp>=3.9.0",
     "openpyxl>=3.1.0",
 ]
 
@@ -118,7 +117,6 @@ pretty = true
 module = [
     "playwright.*",
     "openpyxl.*",
-    "aiohttp.*",
 ]
 ignore_missing_imports = true
 

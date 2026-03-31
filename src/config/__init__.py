@@ -6,7 +6,6 @@
 
 from src.config.logger import get_logger, set_trace_id, setup_logging
 from src.config.settings import (
-    AISettings,
     BrowserSettings,
     ConfigValidationError,
     DatabaseSettings,
@@ -18,7 +17,6 @@ from src.config.settings import (
 )
 
 __all__ = [
-    "AISettings",
     "BrowserSettings",
     "ConfigValidationError",
     "DatabaseSettings",

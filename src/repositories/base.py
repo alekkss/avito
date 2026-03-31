@@ -1,4 +1,4 @@
-"""Абстрактный базовый репозиторий для работы с товарами.
+"""Абстрактный базовый репозиторий для работы с объявлениями аренды.
 
 Определяет контракт (интерфейс), которому должна соответствовать
 любая реализация хранилища данных. Сервисы зависят от этой
@@ -7,15 +7,18 @@
 
 from abc import ABC, abstractmethod
 
-from src.models import NormalizedProduct, RawProduct
+from src.models import RawListing
 
 
-class BaseProductRepository(ABC):
-    """Абстрактный репозиторий для хранения и чтения товаров.
+class BaseListingRepository(ABC):
+    """Абстрактный репозиторий для хранения и чтения объявлений аренды.
 
     Определяет набор операций, необходимых бизнес-логике:
-    сохранение сырых и нормализованных товаров, чтение,
-    проверка существования и управление жизненным циклом хранилища.
+    сохранение объявлений, чтение, проверка существования
+    и управление жизненным циклом хранилища.
+
+    Все реализации (SQLite, PostgreSQL, in-memory) должны
+    наследовать этот класс и реализовать все абстрактные методы.
     """
 
     @abstractmethod
@@ -26,90 +29,50 @@ class BaseProductRepository(ABC):
         """
 
     @abstractmethod
-    def save_raw_product(self, product: RawProduct) -> None:
-        """Сохраняет один сырой товар в хранилище.
+    def save_listing(self, listing: RawListing) -> None:
+        """Сохраняет одно объявление в хранилище.
 
-        Если товар с таким avito_id уже существует, обновляет запись.
-
-        Args:
-            product: Сырой товар, полученный при парсинге.
-        """
-
-    @abstractmethod
-    def save_raw_products(self, products: list[RawProduct]) -> None:
-        """Сохраняет список сырых товаров в хранилище.
-
-        Для каждого товара: если запись с таким avito_id существует —
-        обновляет, иначе — создаёт новую.
+        Если объявление с таким external_id уже существует —
+        обновляет запись (upsert).
 
         Args:
-            products: Список сырых товаров.
+            listing: Объявление аренды, полученное при парсинге.
         """
 
     @abstractmethod
-    def get_all_raw_products(self) -> list[RawProduct]:
-        """Возвращает все сырые товары из хранилища.
+    def save_listings(self, listings: list[RawListing]) -> None:
+        """Сохраняет список объявлений в хранилище.
 
-        Returns:
-            Список всех сохранённых сырых товаров.
-        """
-
-    @abstractmethod
-    def get_raw_products_without_normalization(self) -> list[RawProduct]:
-        """Возвращает сырые товары, ещё не прошедшие AI-нормализацию.
-
-        Returns:
-            Список товаров, для которых нет записи в нормализованных.
-        """
-
-    @abstractmethod
-    def save_normalized_product(self, product: NormalizedProduct) -> None:
-        """Сохраняет один нормализованный товар.
+        Для каждого объявления: если запись с таким external_id
+        существует — обновляет, иначе — создаёт новую.
 
         Args:
-            product: Товар после AI-нормализации.
+            listings: Список объявлений аренды.
         """
 
     @abstractmethod
-    def save_normalized_products(
-        self, products: list[NormalizedProduct]
-    ) -> None:
-        """Сохраняет список нормализованных товаров.
+    def get_all_listings(self) -> list[RawListing]:
+        """Возвращает все объявления из хранилища.
+
+        Returns:
+            Список всех сохранённых объявлений аренды.
+        """
+
+    @abstractmethod
+    def listing_exists(self, external_id: str) -> bool:
+        """Проверяет, существует ли объявление с данным ID.
 
         Args:
-            products: Список товаров после AI-нормализации.
-        """
-
-    @abstractmethod
-    def get_all_normalized_products(self) -> list[NormalizedProduct]:
-        """Возвращает все нормализованные товары.
+            external_id: Уникальный идентификатор объявления
+                в формате "av_<id>".
 
         Returns:
-            Список всех нормализованных товаров для экспорта.
+            True если объявление уже есть в хранилище.
         """
 
     @abstractmethod
-    def raw_product_exists(self, avito_id: str) -> bool:
-        """Проверяет, существует ли сырой товар с данным ID.
-
-        Args:
-            avito_id: Уникальный идентификатор объявления Avito.
-
-        Returns:
-            True если товар уже есть в хранилище.
-        """
-
-    @abstractmethod
-    def get_raw_products_count(self) -> int:
-        """Возвращает общее количество сырых товаров в хранилище.
-
-        Returns:
-            Количество записей.
-        """
-
-    @abstractmethod
-    def get_normalized_products_count(self) -> int:
-        """Возвращает количество нормализованных товаров в хранилище.
+    def get_listings_count(self) -> int:
+        """Возвращает общее количество объявлений в хранилище.
 
         Returns:
             Количество записей.

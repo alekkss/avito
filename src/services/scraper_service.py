@@ -1,21 +1,23 @@
-"""Сервис парсинга товаров из каталога Avito.
+"""Сервис парсинга объявлений из каталога Avito.
 
-Извлекает данные товаров из HTML-страниц каталога Avito,
+Извлекает базовые данные объявлений из HTML-страниц каталога Avito,
 используя CSS-селекторы на основе data-marker атрибутов.
 Поддерживает обход пагинации с retry-логикой, обнаружение
-циклов и сохранение результатов через репозиторий.
+циклов и детальный парсинг карточек через ListingService.
 """
 
 import asyncio
 import random
+from dataclasses import dataclass
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from playwright.async_api import Page
 
 from src.config import ScraperSettings, get_logger
-from src.models import RawProduct
-from src.repositories.base import BaseProductRepository
+from src.models import RawListing
+from src.repositories.base import BaseListingRepository
 from src.services.browser_service import BrowserService
+from src.services.listing_service import ListingService
 
 logger = get_logger("scraper_service")
 
@@ -40,49 +42,77 @@ MAX_INITIAL_NAVIGATION_RETRIES: int = 5
 PAGINATION_CONTAINER_TIMEOUT: int = 15000
 
 
-class ScraperService:
-    """Сервис для парсинга товаров из каталога Avito.
+@dataclass
+class CatalogItem:
+    """Промежуточные данные объявления из каталога.
 
-    Координирует работу BrowserService для навигации и извлекает
-    структурированные данные товаров из HTML-разметки страниц.
-    Поддерживает пагинацию, обнаружение циклов и батчевое
-    сохранение через репозиторий.
+    Содержит только базовую информацию, извлечённую из списка
+    каталога. Используется как входные данные для ListingService,
+    который парсит детальную карточку объявления.
+
+    Attributes:
+        avito_id: Уникальный идентификатор объявления на Avito.
+        title: Название объявления из каталога.
+        price: Базовая цена из каталога (руб./сут.).
+        url: Относительная ссылка на страницу объявления.
+    """
+
+    avito_id: str
+    title: str
+    price: int
+    url: str
+
+    @property
+    def external_id(self) -> str:
+        """Формирует external_id в формате "av_<id>" для склейки данных.
+
+        Returns:
+            Идентификатор в формате "av_<avito_id>".
+        """
+        return f"av_{self.avito_id}"
+
+
+class ScraperService:
+    """Сервис для парсинга объявлений из каталога Avito.
+
+    Координирует работу BrowserService для навигации, извлекает
+    базовые данные из каталога и запускает детальный парсинг
+    карточек через ListingService. Поддерживает пагинацию,
+    обнаружение циклов и батчевое сохранение.
 
     Attributes:
         _browser_service: Сервис управления браузером.
-        _repository: Репозиторий для сохранения товаров.
+        _listing_service: Сервис парсинга карточек объявлений.
+        _repository: Репозиторий для сохранения объявлений.
         _settings: Настройки парсера (URL категории, лимит страниц).
-        _seen_avito_ids: Множество уже встреченных ID товаров.
+        _seen_avito_ids: Множество уже встреченных ID объявлений.
         _total_pages: Общее количество страниц (определяется из пагинации).
-        _base_url: Базовый URL категории (без параметра p), используется
-            для конструирования URL страниц пагинации.
+        _base_url: Базовый URL категории (без параметра p).
     """
 
     # CSS-селекторы для элементов каталога Avito
-    # Основной контейнер с объявлениями — ищем карточки только внутри него
     CATALOG_CONTAINER = "div#bx_serp-item-list"
     ITEM_CARD = "div[data-marker='item']"
     ITEM_TITLE = "a[data-marker='item-title']"
     ITEM_PRICE_META = "meta[itemprop='price']"
-    ITEM_DESCRIPTION = "meta[itemprop='description']"
-    ITEM_IMAGE = "img[itemprop='image']"
-    SELLER_RATING = "[data-marker='seller-rating/score']"
-    SELLER_REVIEWS = "[data-marker='seller-info/summary']"
 
     def __init__(
         self,
         browser_service: BrowserService,
-        repository: BaseProductRepository,
+        listing_service: ListingService,
+        repository: BaseListingRepository,
         settings: ScraperSettings,
     ) -> None:
         """Инициализирует сервис парсинга.
 
         Args:
             browser_service: Сервис для управления браузером.
-            repository: Репозиторий для сохранения спарсенных товаров.
+            listing_service: Сервис для парсинга карточек объявлений.
+            repository: Репозиторий для сохранения объявлений.
             settings: Настройки парсера (URL, лимит страниц).
         """
         self._browser_service = browser_service
+        self._listing_service = listing_service
         self._repository = repository
         self._settings = settings
         self._seen_avito_ids: set[str] = set()
@@ -121,10 +151,8 @@ class ScraperService:
         parsed = urlparse(url)
         params = parse_qs(parsed.query, keep_blank_values=True)
 
-        # Удаляем параметр p — будем подставлять его сами
         params.pop("p", None)
 
-        # Собираем обратно без p
         clean_query = urlencode(params, doseq=True)
         self._base_url = urlunparse((
             parsed.scheme,
@@ -142,10 +170,6 @@ class ScraperService:
 
     def _build_page_url(self, page_num: int) -> str:
         """Конструирует URL для конкретной страницы пагинации.
-
-        Берёт базовый URL (захваченный из браузера после первой
-        загрузки) и добавляет параметр p=N. Для страницы 1
-        параметр p не добавляется (Avito так работает по умолчанию).
 
         Args:
             page_num: Номер страницы.
@@ -165,9 +189,6 @@ class ScraperService:
 
     async def _detect_total_pages(self, page: Page) -> int:
         """Определяет общее количество страниц из пагинации.
-
-        Ищет все номерные кнопки пагинации и находит максимальный
-        номер среди них. Это последняя доступная страница.
 
         Args:
             page: Активная страница Playwright.
@@ -215,18 +236,12 @@ class ScraperService:
     async def _wait_for_unblock(self, page: Page, context: str) -> bool:
         """Ожидает снятия блокировки Avito с повторными попытками.
 
-        При обнаружении блокировки ждёт UNBLOCK_WAIT секунд,
-        перезагружает страницу и проверяет title снова.
-        Повторяет до MAX_UNBLOCK_RETRIES раз.
-
         Args:
             page: Активная страница Playwright.
-            context: Контекст вызова для логирования (например,
-                'pagination', 'element_wait').
+            context: Контекст вызова для логирования.
 
         Returns:
-            True если блокировка снята и страница загружена нормально.
-            False если после всех попыток страница всё ещё заблокирована.
+            True если блокировка снята.
         """
         for attempt in range(1, MAX_UNBLOCK_RETRIES + 1):
             logger.warning(
@@ -239,7 +254,6 @@ class ScraperService:
 
             await asyncio.sleep(UNBLOCK_WAIT)
 
-            # Перезагружаем страницу
             try:
                 current_url = page.url
                 await page.reload(wait_until="domcontentloaded")
@@ -258,10 +272,8 @@ class ScraperService:
                 )
                 continue
 
-            # Ждём после перезагрузки, чтобы страница успела отрендериться
             await asyncio.sleep(5)
 
-            # Проверяем, снята ли блокировка
             is_blocked = await self._browser_service._check_blocked()
             if not is_blocked:
                 logger.info(
@@ -288,34 +300,26 @@ class ScraperService:
     async def _initial_navigate_with_retry(self, page: Page) -> bool:
         """Выполняет первоначальную навигацию с ожиданием разблокировки.
 
-        При блокировке на первой странице запускает цикл ожидания
-        разблокировки и повторяет навигацию. Это позволяет пользователю
-        решить CAPTCHA вручную в открытом окне браузера.
-
         Args:
             page: Активная страница Playwright.
 
         Returns:
-            True если навигация успешна после всех попыток.
+            True если навигация успешна.
         """
         url = self._settings.category_url
 
-        # Первая попытка навигации
         success = await self._browser_service.navigate(url)
         if success:
             return True
 
-        # Навигация не удалась — проверяем, блокировка ли это
         is_blocked = await self._browser_service._check_blocked()
         if not is_blocked:
-            # Не блокировка, а другая ошибка — повторять бессмысленно
             logger.error(
                 "initial_navigation_failed_not_blocked",
                 url=url,
             )
             return False
 
-        # Блокировка — запускаем цикл ожидания разблокировки
         logger.warning(
             "initial_navigation_blocked",
             url=url,
@@ -333,7 +337,6 @@ class ScraperService:
             )
             return False
 
-        # Блокировка снята — повторяем навигацию
         for attempt in range(1, MAX_INITIAL_NAVIGATION_RETRIES + 1):
             logger.info(
                 "initial_navigation_retry",
@@ -350,7 +353,6 @@ class ScraperService:
                 )
                 return True
 
-            # Опять блокировка?
             is_blocked = await self._browser_service._check_blocked()
             if is_blocked:
                 unblocked = await self._wait_for_unblock(
@@ -364,7 +366,6 @@ class ScraperService:
                     )
                     return False
             else:
-                # Не блокировка — какая-то другая ошибка
                 logger.error(
                     "initial_navigation_retry_failed",
                     attempt=attempt,
@@ -385,21 +386,14 @@ class ScraperService:
     async def _check_container_after_pagination(
         self, page: Page, target_page_num: int
     ) -> bool:
-        """Проверяет наличие контейнера с товарами после пагинации.
-
-        В отличие от _wait_for_element_with_retry (который делает
-        до 10 попыток с перезагрузками), этот метод выполняет
-        однократную быструю проверку. Если контейнер не найден —
-        это означает, что товары закончились, а не ошибку загрузки.
-
-        При обнаружении блокировки — запускает ожидание разблокировки.
+        """Проверяет наличие контейнера с объявлениями после пагинации.
 
         Args:
             page: Активная страница Playwright.
             target_page_num: Номер целевой страницы (для логов).
 
         Returns:
-            True если контейнер с товарами найден на странице.
+            True если контейнер с объявлениями найден.
         """
         try:
             await page.wait_for_selector(
@@ -415,7 +409,6 @@ class ScraperService:
         except Exception:
             pass
 
-        # Контейнер не найден — проверяем, блокировка ли это
         is_blocked = await self._browser_service._check_blocked()
         if is_blocked:
             logger.warning(
@@ -427,7 +420,6 @@ class ScraperService:
                 context=f"pagination_container:page_{target_page_num}",
             )
             if unblocked:
-                # После разблокировки пробуем найти контейнер ещё раз
                 try:
                     await page.wait_for_selector(
                         self.CATALOG_CONTAINER,
@@ -441,10 +433,8 @@ class ScraperService:
                 except Exception:
                     pass
 
-            # Блокировка не снята или контейнер всё равно не найден
             return False
 
-        # Не блокировка — значит товары просто закончились
         logger.info(
             "pagination_no_more_items",
             target_page=target_page_num,
@@ -452,41 +442,81 @@ class ScraperService:
         )
         return False
 
-    async def scrape_all(self) -> list[RawProduct]:
-        """Парсит все страницы категории и сохраняет товары.
+    async def scrape_all(self) -> list[RawListing]:
+        """Парсит все страницы каталога и карточки объявлений.
 
-        Основной публичный метод. Запускает браузер, переходит на
-        первую страницу категории с ожиданием разблокировки,
-        парсит товары, переходит по страницам пагинации до лимита,
-        конца или обнаружения цикла.
+        Основной публичный метод. Работает в два этапа:
+        1. Обход каталога — собирает базовые данные (ID, URL, title, price)
+           со всех страниц пагинации.
+        2. Детальный парсинг — заходит в каждую карточку и извлекает
+           полные данные (координаты, календарь, цены на 60 дней и т.д.).
 
         Returns:
-            Полный список спарсенных товаров со всех страниц.
+            Полный список спарсенных объявлений аренды.
         """
-        all_products: list[RawProduct] = []
         self._seen_avito_ids.clear()
         self._total_pages = 0
         self._base_url = ""
 
         page = await self._browser_service.launch()
 
-        # Первоначальная навигация с ожиданием разблокировки
         success = await self._initial_navigate_with_retry(page)
         if not success:
             logger.error(
                 "initial_navigation_failed",
                 url=self._settings.category_url,
             )
-            return all_products
+            return []
 
         await self._browser_service.simulate_human_behavior()
 
-        # Захватываем базовый URL после загрузки первой страницы
         self._capture_base_url(page.url)
-
-        # Определяем общее количество страниц из пагинации
         self._total_pages = await self._detect_total_pages(page)
 
+        # === ЭТАП 1: Обход каталога — сбор базовых данных ===
+        logger.info("catalog_scraping_started")
+        all_catalog_items = await self._scrape_catalog(page)
+
+        if not all_catalog_items:
+            logger.warning("no_catalog_items_found")
+            return []
+
+        logger.info(
+            "catalog_scraping_completed",
+            total_items=len(all_catalog_items),
+        )
+
+        # === ЭТАП 2: Детальный парсинг карточек ===
+        logger.info(
+            "detail_parsing_started",
+            total_items=len(all_catalog_items),
+        )
+        all_listings = await self._parse_all_listings(
+            page, all_catalog_items
+        )
+
+        logger.info(
+            "scraping_completed",
+            catalog_items=len(all_catalog_items),
+            parsed_listings=len(all_listings),
+        )
+
+        return all_listings
+
+    async def _scrape_catalog(self, page: Page) -> list[CatalogItem]:
+        """Обходит все страницы каталога и собирает базовые данные.
+
+        Извлекает из каждой карточки в каталоге: avito_id, title,
+        price и url. Поддерживает пагинацию, обнаружение циклов
+        и пустых страниц.
+
+        Args:
+            page: Активная страница Playwright.
+
+        Returns:
+            Список промежуточных данных из каталога.
+        """
+        all_items: list[CatalogItem] = []
         current_page_num = 1
         max_pages = self._settings.max_pages
         consecutive_empty_pages = 0
@@ -495,54 +525,53 @@ class ScraperService:
             logger.info(
                 "scraping_page",
                 page_number=current_page_num,
-                url_page_number=self._extract_page_number_from_url(page.url),
+                url_page_number=self._extract_page_number_from_url(
+                    page.url
+                ),
                 max_pages=max_pages if max_pages > 0 else "unlimited",
-                total_pages=self._total_pages if self._total_pages > 0 else "unknown",
-                total_unique_products=len(self._seen_avito_ids),
+                total_pages=(
+                    self._total_pages if self._total_pages > 0
+                    else "unknown"
+                ),
+                total_unique_items=len(self._seen_avito_ids),
             )
 
-            products = await self._parse_current_page(page)
+            items = await self._parse_current_page(page)
 
-            if products:
-                new_products: list[RawProduct] = []
+            if items:
+                new_items: list[CatalogItem] = []
                 duplicate_count = 0
 
-                for product in products:
-                    if product.avito_id in self._seen_avito_ids:
+                for item in items:
+                    if item.avito_id in self._seen_avito_ids:
                         duplicate_count += 1
                     else:
-                        self._seen_avito_ids.add(product.avito_id)
-                        new_products.append(product)
+                        self._seen_avito_ids.add(item.avito_id)
+                        new_items.append(item)
 
-                # Обнаружение цикла: если большинство товаров — дубликаты
-                if len(products) > 0:
-                    duplicate_ratio = duplicate_count / len(products)
+                if len(items) > 0:
+                    duplicate_ratio = duplicate_count / len(items)
                     if duplicate_ratio >= DUPLICATE_THRESHOLD:
                         logger.warning(
                             "pagination_cycle_detected",
                             page_number=current_page_num,
-                            total_items=len(products),
+                            total_items=len(items),
                             duplicates=duplicate_count,
                             duplicate_ratio=f"{duplicate_ratio:.0%}",
                         )
-                        if new_products:
-                            self._repository.save_raw_products(new_products)
-                            all_products.extend(new_products)
+                        all_items.extend(new_items)
                         break
 
-                if new_products:
-                    self._repository.save_raw_products(new_products)
-                    all_products.extend(new_products)
-
+                all_items.extend(new_items)
                 consecutive_empty_pages = 0
 
                 logger.info(
                     "page_scraped",
                     page_number=current_page_num,
-                    items_on_page=len(products),
-                    new_items=len(new_products),
+                    items_on_page=len(items),
+                    new_items=len(new_items),
                     duplicates=duplicate_count,
-                    total_items=len(all_products),
+                    total_items=len(all_items),
                 )
             else:
                 consecutive_empty_pages += 1
@@ -567,8 +596,10 @@ class ScraperService:
                 )
                 break
 
-            # Проверяем, не достигли ли последней страницы
-            if self._total_pages > 0 and current_page_num >= self._total_pages:
+            if (
+                self._total_pages > 0
+                and current_page_num >= self._total_pages
+            ):
                 logger.info(
                     "last_page_reached",
                     current_page=current_page_num,
@@ -576,7 +607,9 @@ class ScraperService:
                 )
                 break
 
-            has_next = await self._go_to_next_page(page, current_page_num)
+            has_next = await self._go_to_next_page(
+                page, current_page_num
+            )
             if not has_next:
                 logger.info(
                     "pagination_ended",
@@ -586,29 +619,83 @@ class ScraperService:
 
             current_page_num += 1
 
-            # Обновляем общее количество страниц (может измениться)
             updated_total = await self._detect_total_pages(page)
             if updated_total > 0:
                 self._total_pages = updated_total
 
             await self._browser_service.simulate_human_behavior()
 
-        logger.info(
-            "scraping_completed",
-            total_pages=current_page_num,
-            total_items=len(all_products),
-            unique_avito_ids=len(self._seen_avito_ids),
-        )
+        return all_items
 
-        return all_products
+    async def _parse_all_listings(
+        self,
+        page: Page,
+        catalog_items: list[CatalogItem],
+    ) -> list[RawListing]:
+        """Парсит детальные карточки всех объявлений.
+
+        Последовательно заходит в каждую карточку объявления,
+        извлекает полные данные через ListingService и сохраняет
+        в репозиторий.
+
+        Args:
+            page: Активная страница Playwright.
+            catalog_items: Список базовых данных из каталога.
+
+        Returns:
+            Список полностью спарсенных объявлений.
+        """
+        all_listings: list[RawListing] = []
+        total = len(catalog_items)
+
+        for index, item in enumerate(catalog_items, start=1):
+            logger.info(
+                "parsing_listing",
+                progress=f"{index}/{total}",
+                external_id=item.external_id,
+                title=item.title[:50],
+            )
+
+            listing = await self._listing_service.parse_listing(
+                page=page,
+                external_id=item.external_id,
+                url=item.url,
+                title=item.title,
+                base_price=item.price,
+            )
+
+            if listing is not None:
+                self._repository.save_listing(listing)
+                all_listings.append(listing)
+
+                logger.info(
+                    "listing_saved",
+                    progress=f"{index}/{total}",
+                    external_id=listing.external_id,
+                    room_category=listing.room_category.value,
+                )
+            else:
+                logger.warning(
+                    "listing_parse_failed",
+                    progress=f"{index}/{total}",
+                    external_id=item.external_id,
+                    url=item.url[:100],
+                )
+
+            # Каждые 10 объявлений — логируем общий прогресс
+            if index % 10 == 0:
+                logger.info(
+                    "detail_parsing_progress",
+                    parsed=index,
+                    total=total,
+                    successful=len(all_listings),
+                    failed=index - len(all_listings),
+                )
+
+        return all_listings
 
     async def _scroll_page_naturally(self, page: Page) -> None:
-        """Прокручивает страницу как реальный пользователь (~10 секунд).
-
-        Последовательно прокручивает страницу вниз небольшими шагами
-        с рандомными паузами, имитируя чтение контента. Затем
-        возвращается наверх. Это помогает подгрузить lazy-loaded
-        контент и снижает риск обнаружения автоматизации.
+        """Прокручивает страницу как реальный пользователь.
 
         Args:
             page: Активная страница Playwright.
@@ -627,14 +714,10 @@ class ScraperService:
             scroll_step_min = 200
             scroll_step_max = 500
 
-            logger.debug(
-                "scroll_started",
-                total_height=total_height,
-                viewport_height=viewport_height,
-            )
-
             while current_position < total_height:
-                scroll_amount = random.randint(scroll_step_min, scroll_step_max)
+                scroll_amount = random.randint(
+                    scroll_step_min, scroll_step_max
+                )
                 current_position += scroll_amount
 
                 if current_position > total_height:
@@ -649,14 +732,15 @@ class ScraperService:
 
                 if random.random() < 0.15:
                     back_scroll = random.randint(50, 150)
-                    current_position = max(0, current_position - back_scroll)
+                    current_position = max(
+                        0, current_position - back_scroll
+                    )
                     await page.evaluate(
                         f"window.scrollTo(0, {current_position})"
                     )
                     await asyncio.sleep(random.uniform(0.3, 0.7))
 
             await asyncio.sleep(random.uniform(0.5, 1.5))
-
             await page.evaluate("window.scrollTo(0, 0)")
             await asyncio.sleep(random.uniform(0.5, 1.0))
 
@@ -675,12 +759,6 @@ class ScraperService:
         element_name: str,
     ) -> bool:
         """Ожидает появления элемента на странице с повторными попытками.
-
-        При отсутствии элемента проверяет блокировку. Если страница
-        заблокирована — запускает цикл ожидания разблокировки
-        (до MAX_UNBLOCK_RETRIES попыток с перезагрузкой).
-        Если не заблокирована — перезагружает страницу и ждёт снова.
-        Делает до MAX_ELEMENT_RETRIES общих попыток.
 
         Args:
             page: Активная страница Playwright.
@@ -706,19 +784,14 @@ class ScraperService:
             except Exception:
                 pass
 
-            # Элемент не найден — проверяем блокировку
             is_blocked = await self._browser_service._check_blocked()
             if is_blocked:
-                # Запускаем цикл ожидания разблокировки
                 unblocked = await self._wait_for_unblock(
                     page,
                     context=f"element_wait:{element_name}",
                 )
                 if unblocked:
-                    # Блокировка снята — пробуем найти элемент снова
-                    # (не тратим попытку, просто продолжаем цикл)
                     continue
-                # Блокировка не снята после всех попыток
                 return False
 
             if attempt >= MAX_ELEMENT_RETRIES:
@@ -740,7 +813,6 @@ class ScraperService:
                 url=page.url,
             )
 
-            # Перезагружаем текущую страницу
             try:
                 current_url = page.url
                 await page.reload(wait_until="domcontentloaded")
@@ -762,23 +834,22 @@ class ScraperService:
 
         return False
 
-    async def _parse_current_page(self, page: Page) -> list[RawProduct]:
-        """Парсит карточки товаров на текущей странице.
+    async def _parse_current_page(
+        self, page: Page
+    ) -> list[CatalogItem]:
+        """Парсит карточки объявлений на текущей странице каталога.
 
-        Ожидает появления контейнера div#bx_serp-item-list с повторными
-        попытками, прокручивает страницу для подгрузки lazy-контента,
-        затем извлекает данные из каждой карточки, находящейся
-        строго внутри этого контейнера.
+        Извлекает только базовые данные: avito_id, title, price, url.
+        Детальный парсинг выполняется позже через ListingService.
 
         Args:
             page: Активная страница Playwright.
 
         Returns:
-            Список товаров, извлечённых из контейнера на текущей странице.
+            Список промежуточных данных из каталога.
         """
-        products: list[RawProduct] = []
+        items: list[CatalogItem] = []
 
-        # Ожидаем появления основного контейнера с объявлениями
         catalog_found = await self._wait_for_element_with_retry(
             page,
             self.CATALOG_CONTAINER,
@@ -786,20 +857,18 @@ class ScraperService:
         )
         if not catalog_found:
             logger.warning("catalog_container_not_found_after_retries")
-            return products
+            return items
 
         await self._scroll_page_naturally(page)
 
-        # Находим сам контейнер div#bx_serp-item-list
         container = await page.query_selector(self.CATALOG_CONTAINER)
         if not container:
             logger.warning(
                 "catalog_container_disappeared_after_scroll",
                 selector=self.CATALOG_CONTAINER,
             )
-            return products
+            return items
 
-        # Ищем карточки товаров ТОЛЬКО внутри контейнера
         item_cards = await container.query_selector_all(self.ITEM_CARD)
 
         if not item_cards:
@@ -807,7 +876,7 @@ class ScraperService:
                 "no_item_cards_in_container",
                 container=self.CATALOG_CONTAINER,
             )
-            return products
+            return items
 
         logger.info(
             "item_cards_found",
@@ -817,9 +886,9 @@ class ScraperService:
 
         for card in item_cards:
             try:
-                product = await self._parse_single_card(card)
-                if product is not None:
-                    products.append(product)
+                item = await self._parse_single_card(card)
+                if item is not None:
+                    items.append(item)
             except Exception as e:
                 logger.warning(
                     "card_parse_error",
@@ -827,21 +896,21 @@ class ScraperService:
                     error_type=type(e).__name__,
                 )
 
-        return products
+        return items
 
     async def _parse_single_card(
         self, card: object
-    ) -> RawProduct | None:
-        """Извлекает данные одного товара из карточки.
+    ) -> CatalogItem | None:
+        """Извлекает базовые данные объявления из карточки каталога.
 
-        Парсит HTML-элемент карточки товара, извлекая название, цену,
-        ссылку, описание, фото и информацию о продавце.
+        Парсит только avito_id, title, price и url — минимум данных,
+        необходимых для последующего детального парсинга карточки.
 
         Args:
-            card: ElementHandle карточки товара.
+            card: ElementHandle карточки объявления.
 
         Returns:
-            RawProduct с данными товара или None если не удалось распарсить.
+            CatalogItem с базовыми данными или None.
         """
         avito_id = await card.get_attribute("data-item-id")
         if not avito_id:
@@ -872,109 +941,33 @@ class ScraperService:
                     price_str=price_str,
                 )
 
-        description = ""
-        desc_meta = await card.query_selector(self.ITEM_DESCRIPTION)
-        if desc_meta:
-            description = await desc_meta.get_attribute("content") or ""
-
-        image_url = ""
-        img_element = await card.query_selector(self.ITEM_IMAGE)
-        if img_element:
-            image_url = await img_element.get_attribute("src") or ""
-
-        seller_name = await self._extract_seller_name(card)
-        seller_rating = await self._extract_text_by_selector(
-            card, self.SELLER_RATING
-        )
-        seller_reviews = await self._extract_text_by_selector(
-            card, self.SELLER_REVIEWS
-        )
-
-        product = RawProduct(
+        item = CatalogItem(
             avito_id=avito_id,
             title=title,
             price=price,
             url=url,
-            description=description,
-            image_url=image_url,
-            seller_name=seller_name,
-            seller_rating=seller_rating,
-            seller_reviews=seller_reviews,
         )
 
         logger.debug(
-            "product_parsed",
+            "catalog_item_parsed",
             avito_id=avito_id,
             title=title[:50],
             price=price,
         )
 
-        return product
-
-    async def _extract_seller_name(self, card: object) -> str:
-        """Извлекает имя продавца из карточки товара.
-
-        Продавец находится внутри блока iva-item-sellerInfo
-        в первом теге <p> внутри ссылки <a>.
-
-        Args:
-            card: ElementHandle карточки товара.
-
-        Returns:
-            Имя продавца или пустая строка.
-        """
-        try:
-            seller_block = await card.query_selector(
-                "div[class*='iva-item-sellerInfo'] a p"
-            )
-            if seller_block:
-                text = (await seller_block.inner_text()).strip()
-                return text
-        except Exception:
-            pass
-        return ""
-
-    async def _extract_text_by_selector(
-        self, card: object, selector: str
-    ) -> str:
-        """Извлекает текстовое содержимое элемента по CSS-селектору.
-
-        Args:
-            card: ElementHandle карточки товара.
-            selector: CSS-селектор элемента.
-
-        Returns:
-            Текст элемента или пустая строка если не найден.
-        """
-        try:
-            element = await card.query_selector(selector)
-            if element:
-                text = (await element.inner_text()).strip()
-                return text
-        except Exception:
-            pass
-        return ""
+        return item
 
     async def _go_to_next_page(
         self, page: Page, current_page_num: int
     ) -> bool:
         """Переходит на следующую страницу пагинации.
 
-        Конструирует URL следующей страницы самостоятельно, подставляя
-        параметр p=N в базовый URL. После перехода выполняет быструю
-        проверку наличия контейнера с товарами. Если контейнер не
-        найден и страница не заблокирована — это означает конец
-        пагинации (товары закончились), а не ошибку загрузки.
-
-        При обнаружении блокировки запускает цикл ожидания
-        разблокировки (до MAX_UNBLOCK_RETRIES попыток с перезагрузкой).
-
         Args:
             page: Активная страница Playwright.
             current_page_num: Номер текущей страницы.
 
         Returns:
-            True если переход на следующую страницу успешен и валиден.
+            True если переход успешен.
         """
         target_page_num = current_page_num + 1
 
@@ -994,7 +987,6 @@ class ScraperService:
 
         for attempt in range(1, MAX_PAGINATION_RETRIES + 1):
             try:
-                # Случайная задержка перед переходом
                 delay = random.uniform(2.0, 5.0)
                 logger.info(
                     "next_page_navigating",
@@ -1004,21 +996,18 @@ class ScraperService:
                 )
                 await asyncio.sleep(delay)
 
-                # Переходим на сконструированный URL
                 await page.goto(
                     next_url,
                     wait_until="domcontentloaded",
                     timeout=60000,
                 )
 
-                # Ожидание после загрузки DOM
                 logger.info(
                     "next_page_waiting",
                     wait_seconds=ELEMENT_RETRY_WAIT,
                 )
                 await asyncio.sleep(ELEMENT_RETRY_WAIT)
 
-                # Проверяем блокировку — с ожиданием разблокировки
                 is_blocked = await self._browser_service._check_blocked()
                 if is_blocked:
                     unblocked = await self._wait_for_unblock(
@@ -1032,7 +1021,6 @@ class ScraperService:
                         )
                         return False
 
-                    # Блокировка снята — повторяем переход на целевую страницу
                     logger.info(
                         "retrying_navigation_after_unblock",
                         target_page=target_page_num,
@@ -1054,8 +1042,9 @@ class ScraperService:
                             continue
                         return False
 
-                    # Проверяем блокировку ещё раз
-                    still_blocked = await self._browser_service._check_blocked()
+                    still_blocked = (
+                        await self._browser_service._check_blocked()
+                    )
                     if still_blocked:
                         logger.warning(
                             "blocked_again_after_retry_navigation",
@@ -1065,18 +1054,17 @@ class ScraperService:
                             continue
                         return False
 
-                # Быстрая проверка наличия контейнера с товарами.
-                # Если контейнера нет и нет блокировки — товары закончились.
-                container_found = await self._check_container_after_pagination(
-                    page, target_page_num
+                container_found = (
+                    await self._check_container_after_pagination(
+                        page, target_page_num
+                    )
                 )
                 if not container_found:
-                    # Метод уже залогировал причину (блокировка или конец товаров)
                     return False
 
-                # ВАЛИДАЦИЯ: проверяем, что реальный URL соответствует
-                # ожидаемому номеру страницы
-                actual_page_num = self._extract_page_number_from_url(page.url)
+                actual_page_num = self._extract_page_number_from_url(
+                    page.url
+                )
 
                 if actual_page_num == target_page_num:
                     logger.info(
@@ -1087,7 +1075,6 @@ class ScraperService:
                     )
                     return True
 
-                # Avito сбросил на другую страницу
                 logger.warning(
                     "page_number_mismatch",
                     target_page=target_page_num,
@@ -1102,7 +1089,9 @@ class ScraperService:
                         last_successful_page=current_page_num,
                         attempted_page=target_page_num,
                     )
-                    fallback_url = self._build_page_url(current_page_num)
+                    fallback_url = self._build_page_url(
+                        current_page_num
+                    )
                     if fallback_url:
                         try:
                             await page.goto(

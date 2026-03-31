@@ -1,47 +1,90 @@
-"""Доменные модели товаров.
+"""Доменные модели объявлений аренды.
 
-Содержит dataclass-модели для представления товаров на разных
-этапах обработки:
-    - RawProduct: сырые данные, извлечённые со страницы Avito
-    - NormalizedProduct: данные после AI-нормализации с группировкой
+Содержит dataclass-модель для представления объявления
+краткосрочной аренды на Avito:
+    - RawListing: данные, извлечённые из карточки объявления
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
 
 
-@dataclass(frozen=True)
-class RawProduct:
-    """Сырой товар, извлечённый из каталога Avito.
+class RoomCategory(Enum):
+    """Категория жилья по количеству комнат.
 
-    Содержит данные в том виде, в котором они получены со страницы,
-    без какой-либо обработки или нормализации.
-
-    Attributes:
-        avito_id: Уникальный идентификатор объявления на Avito.
-        title: Оригинальное название товара из объявления.
-        price: Цена в рублях (целое число).
-        url: Относительная ссылка на страницу объявления.
-        description: Текст описания из сниппета (может быть обрезан).
-        image_url: Ссылка на основное изображение товара.
-        seller_name: Имя или название продавца.
-        seller_rating: Рейтинг продавца (например, "4,7").
-        seller_reviews: Текст с количеством отзывов (например, "128 отзывов").
-        scraped_at: Дата и время парсинга (UTC).
+    Используется для классификации объявлений аренды.
+    Значения соответствуют стандартной классификации Avito.
     """
 
-    avito_id: str
-    title: str
-    price: int
-    url: str
-    description: str = ""
-    image_url: str = ""
-    seller_name: str = ""
-    seller_rating: str = ""
-    seller_reviews: str = ""
-    scraped_at: datetime = field(
+    ROOM = "Комната"
+    STUDIO = "Студия"
+    ONE = "1к"
+    TWO = "2к"
+    THREE = "3к"
+    FOUR_PLUS = "4к+"
+    UNKNOWN = "Неизвестно"
+
+
+@dataclass
+class RawListing:
+    """Объявление краткосрочной аренды, извлечённое с Avito.
+
+    Содержит 13 обязательных полей из ТЗ и резервное поле
+    analytics_payload для будущей аналитики. Поля событий
+    (price_change_event, booking_block_event, cancellation_event)
+    на Этапе 1 остаются пустыми — заполняются Delta Engine
+    на Этапе 2.
+
+    Attributes:
+        external_id: Уникальный идентификатор объявления
+            в формате "av_<id>" для склейки данных между источниками.
+        latitude: Широта объекта (координаты).
+        longitude: Долгота объекта (координаты).
+        room_category: Категория жилья (Комната, Студия, 1к–4к+).
+        price_60_days: Массив цен на 60 дней вперёд.
+            Индекс 0 — сегодня, индекс 59 — через 59 дней.
+            Значение 0 означает, что цена не указана.
+        calendar_60_days: Массив занятости на 60 дней вперёд.
+            0 — свободен, 1 — занят.
+        snapshot_timestamp: Время фиксации данных (UTC).
+        last_host_update: Время последнего обновления календаря хостом.
+            None если информация недоступна.
+        min_stay: Минимальный срок аренды в сутках.
+        is_instant_book: Наличие мгновенного бронирования.
+        host_rating: Рейтинг хоста (0.0 если не указан).
+        price_change_event: Данные события изменения цены.
+            Заполняется Delta Engine (Этап 2). На Этапе 1 — None.
+        booking_block_event: Данные события бронирования (блок дат).
+            Заполняется Delta Engine (Этап 2). На Этапе 1 — None.
+        cancellation_event: Данные события отмены бронирования.
+            Заполняется Delta Engine (Этап 2). На Этапе 1 — None.
+        analytics_payload: Резервное поле для будущей аналитики.
+            Хранится как JSONB в БД. На Этапе 1 — None.
+        url: Относительная ссылка на объявление на Avito.
+        title: Оригинальное название объявления (для справки).
+    """
+
+    external_id: str
+    latitude: float
+    longitude: float
+    room_category: RoomCategory
+    price_60_days: list[int]
+    calendar_60_days: list[int]
+    snapshot_timestamp: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    last_host_update: datetime | None = None
+    min_stay: int = 1
+    is_instant_book: bool = False
+    host_rating: float = 0.0
+    price_change_event: dict[str, Any] | None = None
+    booking_block_event: dict[str, Any] | None = None
+    cancellation_event: dict[str, Any] | None = None
+    analytics_payload: dict[str, Any] | None = None
+    url: str = ""
+    title: str = ""
 
     @property
     def full_url(self) -> str:
@@ -55,89 +98,48 @@ class RawProduct:
             return self.url
         return f"{base}{self.url}"
 
+    @property
+    def coordinates(self) -> tuple[float, float]:
+        """Координаты объекта в виде кортежа (lat, lon).
 
-@dataclass(frozen=True)
-class NormalizedProduct:
-    """Товар после AI-нормализации.
+        Returns:
+            Кортеж (широта, долгота).
+        """
+        return (self.latitude, self.longitude)
 
-    Содержит как оригинальные данные, так и результат обработки
-    моделью AI — нормализованное название для группировки
-    одинаковых товаров.
+    @property
+    def occupancy_rate(self) -> float:
+        """Процент занятости на ближайшие 60 дней.
 
-    Attributes:
-        avito_id: Уникальный идентификатор объявления на Avito.
-        original_title: Оригинальное название из объявления.
-        normalized_title: Нормализованное AI название для группировки.
-        product_category: Категория товара, определённая AI.
-        key_specs: Ключевые характеристики, извлечённые AI.
-        price: Цена в рублях.
-        url: Относительная ссылка на объявление.
-        full_url: Абсолютный URL объявления.
-        description: Текст описания из сниппета.
-        image_url: Ссылка на основное изображение.
-        seller_name: Имя или название продавца.
-        seller_rating: Рейтинг продавца.
-        seller_reviews: Количество отзывов продавца.
-        scraped_at: Дата и время парсинга (UTC).
-        normalized_at: Дата и время нормализации AI (UTC).
-    """
+        Returns:
+            Доля занятых дней от 0.0 до 1.0.
+        """
+        if not self.calendar_60_days:
+            return 0.0
+        occupied = sum(self.calendar_60_days)
+        return occupied / len(self.calendar_60_days)
 
-    avito_id: str
-    original_title: str
-    normalized_title: str
-    product_category: str
-    key_specs: str
-    price: int
-    url: str
-    full_url: str
-    description: str = ""
-    image_url: str = ""
-    seller_name: str = ""
-    seller_rating: str = ""
-    seller_reviews: str = ""
-    scraped_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
-    normalized_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+    @property
+    def average_price(self) -> float:
+        """Средняя цена за сутки по свободным дням.
 
+        Считает среднюю цену только по тем дням, где цена > 0
+        и день свободен (calendar = 0).
 
-def raw_to_normalized(
-    raw: RawProduct,
-    normalized_title: str,
-    product_category: str,
-    key_specs: str,
-) -> NormalizedProduct:
-    """Создаёт NormalizedProduct из RawProduct и результатов AI.
+        Returns:
+            Средняя цена или 0.0 если нет данных.
+        """
+        if not self.price_60_days or not self.calendar_60_days:
+            return 0.0
 
-    Фабричная функция, которая объединяет сырые данные с результатами
-    AI-нормализации в единую сущность. Сохраняет все оригинальные
-    поля из RawProduct.
+        prices = [
+            price
+            for price, occupied in zip(
+                self.price_60_days, self.calendar_60_days
+            )
+            if price > 0 and occupied == 0
+        ]
 
-    Args:
-        raw: Исходный сырой товар с Avito.
-        normalized_title: Нормализованное название от AI.
-        product_category: Категория товара от AI.
-        key_specs: Ключевые характеристики от AI.
-
-    Returns:
-        Новый экземпляр NormalizedProduct.
-    """
-    return NormalizedProduct(
-        avito_id=raw.avito_id,
-        original_title=raw.title,
-        normalized_title=normalized_title,
-        product_category=product_category,
-        key_specs=key_specs,
-        price=raw.price,
-        url=raw.url,
-        full_url=raw.full_url,
-        description=raw.description,
-        image_url=raw.image_url,
-        seller_name=raw.seller_name,
-        seller_rating=raw.seller_rating,
-        seller_reviews=raw.seller_reviews,
-        scraped_at=raw.scraped_at,
-        normalized_at=datetime.now(timezone.utc),
-    )
+        if not prices:
+            return 0.0
+        return sum(prices) / len(prices)

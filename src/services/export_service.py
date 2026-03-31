@@ -1,7 +1,7 @@
 """Сервис экспорта данных в Excel.
 
 Формирует Excel-файл с одним листом, содержащим все
-нормализованные товары. Таблица оптимизирована для
+объявления краткосрочной аренды. Таблица оптимизирована для
 фильтрации и сортировки в Excel: автофильтры,
 фиксированная шапка, автоширина столбцов.
 """
@@ -14,56 +14,60 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from src.config import ExportSettings, get_logger
-from src.models import NormalizedProduct
-from src.repositories.base import BaseProductRepository
+from src.models import RawListing
+from src.repositories.base import BaseListingRepository
 
 logger = get_logger("export_service")
 
 
 # Определение столбцов отчёта: (заголовок, ширина в символах)
 REPORT_COLUMNS: list[tuple[str, int]] = [
-    ("Нормализованное название", 40),
-    ("Категория", 20),
-    ("Характеристики", 35),
-    ("Цена (руб.)", 14),
-    ("Оригинальное название", 45),
-    ("Продавец", 20),
-    ("Рейтинг продавца", 16),
-    ("Отзывы", 16),
-    ("Ссылка", 60),
-    ("Описание", 50),
-    ("Дата парсинга", 20),
+    ("ID объявления", 18),
+    ("Название", 45),
+    ("Категория жилья", 16),
+    ("Широта", 12),
+    ("Долгота", 12),
+    ("Средняя цена (руб./сут.)", 22),
+    ("Занятость (%)", 14),
+    ("Мин. срок (сут.)", 16),
+    ("Мгновенное бронирование", 22),
+    ("Рейтинг хоста", 14),
+    ("Последнее обновление хостом", 26),
+    ("Цены 60 дней", 40),
+    ("Календарь 60 дней", 40),
+    ("Ссылка", 55),
+    ("Дата снимка", 20),
 ]
 
 
 class ExportService:
-    """Сервис для экспорта товаров в Excel-файл.
+    """Сервис для экспорта объявлений аренды в Excel-файл.
 
-    Читает нормализованные товары из репозитория и формирует
+    Читает объявления из репозитория и формирует
     отформатированный Excel-файл с автофильтрами и стилями
     для удобной работы в Excel.
 
     Attributes:
-        _repository: Репозиторий для чтения нормализованных товаров.
+        _repository: Репозиторий для чтения объявлений.
         _settings: Настройки экспорта (путь к файлу).
     """
 
     def __init__(
         self,
-        repository: BaseProductRepository,
+        repository: BaseListingRepository,
         settings: ExportSettings,
     ) -> None:
         """Инициализирует сервис экспорта.
 
         Args:
-            repository: Репозиторий с нормализованными товарами.
+            repository: Репозиторий с объявлениями аренды.
             settings: Настройки экспорта (путь к выходному файлу).
         """
         self._repository = repository
         self._settings = settings
 
     def export(self) -> str:
-        """Экспортирует все нормализованные товары в Excel-файл.
+        """Экспортирует все объявления аренды в Excel-файл.
 
         Основной публичный метод. Читает данные из репозитория,
         создаёт Excel-файл с форматированной таблицей и сохраняет
@@ -71,16 +75,17 @@ class ExportService:
 
         Returns:
             Абсолютный путь к созданному Excel-файлу.
+            Пустая строка если нет данных для экспорта.
         """
-        products = self._repository.get_all_normalized_products()
+        listings = self._repository.get_all_listings()
 
-        if not products:
-            logger.warning("no_products_to_export")
+        if not listings:
+            logger.warning("no_listings_to_export")
             return ""
 
         logger.info(
             "export_started",
-            products_count=len(products),
+            listings_count=len(listings),
             export_path=self._settings.export_path,
         )
 
@@ -88,19 +93,19 @@ class ExportService:
         ws = wb.active
         if ws is None:
             ws = wb.create_sheet()
-        ws.title = "Товары Avito"
+        ws.title = "Аренда Avito"
 
         self._write_header(ws)
-        self._write_data(ws, products)
-        self._apply_formatting(ws, len(products))
+        self._write_data(ws, listings)
+        self._apply_formatting(ws, len(listings))
 
         output_path = self._save_workbook(wb)
 
-        unique_titles = len({p.normalized_title for p in products})
+        categories = {listing.room_category.value for listing in listings}
         logger.info(
             "export_completed",
-            products_count=len(products),
-            unique_products=unique_titles,
+            listings_count=len(listings),
+            unique_categories=len(categories),
             export_path=output_path,
         )
 
@@ -145,19 +150,19 @@ class ExportService:
     def _write_data(
         self,
         ws: Worksheet,
-        products: list[NormalizedProduct],
+        listings: list[RawListing],
     ) -> None:
-        """Записывает данные товаров в лист начиная со второй строки.
+        """Записывает данные объявлений в лист начиная со второй строки.
 
         Args:
             ws: Рабочий лист Excel.
-            products: Список нормализованных товаров.
+            listings: Список объявлений аренды.
         """
         data_alignment = Alignment(
             vertical="top",
             wrap_text=False,
         )
-        price_alignment = Alignment(
+        number_alignment = Alignment(
             horizontal="right",
             vertical="top",
         )
@@ -178,8 +183,8 @@ class ExportService:
             size=10,
         )
 
-        for row_index, product in enumerate(products, start=2):
-            row_data = self._product_to_row(product)
+        for row_index, listing in enumerate(listings, start=2):
+            row_data = self._listing_to_row(listing)
 
             for col_index, value in enumerate(row_data, start=1):
                 cell = ws.cell(
@@ -191,14 +196,20 @@ class ExportService:
                 cell.alignment = data_alignment
                 cell.border = thin_border
 
-            # Форматирование столбца "Цена"
-            price_cell = ws.cell(row=row_index, column=4)
-            price_cell.alignment = price_alignment
+            # Форматирование числовых столбцов
+            # Столбец 6 — Средняя цена
+            price_cell = ws.cell(row=row_index, column=6)
+            price_cell.alignment = number_alignment
             price_cell.number_format = "#,##0"
 
-            # Форматирование столбца "Ссылка" как гиперссылка
-            link_cell = ws.cell(row=row_index, column=9)
-            url = product.full_url
+            # Столбец 7 — Занятость (%)
+            occupancy_cell = ws.cell(row=row_index, column=7)
+            occupancy_cell.alignment = number_alignment
+            occupancy_cell.number_format = "0.0%"
+
+            # Столбец 14 — Ссылка как гиперссылка
+            link_cell = ws.cell(row=row_index, column=14)
+            url = listing.full_url
             if url:
                 link_cell.hyperlink = url
                 link_cell.font = link_font
@@ -213,35 +224,97 @@ class ExportService:
                 for col_index in range(1, len(REPORT_COLUMNS) + 1):
                     ws.cell(row=row_index, column=col_index).fill = even_fill
 
-    def _product_to_row(
-        self, product: NormalizedProduct
-    ) -> list[str | int]:
-        """Преобразует NormalizedProduct в список значений строки.
+    def _listing_to_row(
+        self, listing: RawListing
+    ) -> list[str | int | float]:
+        """Преобразует RawListing в список значений строки.
 
         Порядок значений соответствует порядку столбцов
         в REPORT_COLUMNS.
 
         Args:
-            product: Нормализованный товар.
+            listing: Объявление аренды.
 
         Returns:
             Список значений для одной строки Excel.
         """
-        scraped_date = product.scraped_at.strftime("%Y-%m-%d %H:%M")
+        snapshot_date = listing.snapshot_timestamp.strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+        last_update = ""
+        if listing.last_host_update is not None:
+            last_update = listing.last_host_update.strftime(
+                "%Y-%m-%d %H:%M"
+            )
+
+        prices_str = self._format_array_short(listing.price_60_days)
+        calendar_str = self._format_calendar_short(listing.calendar_60_days)
 
         return [
-            product.normalized_title,
-            product.product_category,
-            product.key_specs,
-            product.price,
-            product.original_title,
-            product.seller_name,
-            product.seller_rating,
-            product.seller_reviews,
-            product.full_url,
-            product.description[:200],
-            scraped_date,
+            listing.external_id,
+            listing.title,
+            listing.room_category.value,
+            listing.latitude,
+            listing.longitude,
+            round(listing.average_price),
+            listing.occupancy_rate,
+            listing.min_stay,
+            "Да" if listing.is_instant_book else "Нет",
+            listing.host_rating,
+            last_update,
+            prices_str,
+            calendar_str,
+            listing.full_url,
+            snapshot_date,
         ]
+
+    def _format_array_short(self, values: list[int]) -> str:
+        """Форматирует массив цен в компактную строку.
+
+        Показывает первые 7 значений и общее количество.
+        Например: "3500, 3500, 4000, 4000, 5000, 3500, 3500... (60)"
+
+        Args:
+            values: Массив целых чисел (цены).
+
+        Returns:
+            Компактная строковая запись массива.
+        """
+        if not values:
+            return "—"
+
+        preview_count = 7
+        preview = [str(v) for v in values[:preview_count]]
+        result = ", ".join(preview)
+
+        if len(values) > preview_count:
+            result += f"... ({len(values)})"
+
+        return result
+
+    def _format_calendar_short(self, values: list[int]) -> str:
+        """Форматирует массив занятости в компактную строку.
+
+        Показывает первые 14 дней как последовательность 0/1.
+        Например: "00011100001110... (60)"
+
+        Args:
+            values: Массив 0/1 (занятость).
+
+        Returns:
+            Компактная строковая запись календаря.
+        """
+        if not values:
+            return "—"
+
+        preview_count = 14
+        preview = "".join(str(v) for v in values[:preview_count])
+
+        if len(values) > preview_count:
+            preview += f"... ({len(values)})"
+
+        return preview
 
     def _apply_formatting(
         self, ws: Worksheet, data_rows: int

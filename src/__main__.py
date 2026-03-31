@@ -2,9 +2,9 @@
 
 Связывает все компоненты системы и запускает полный цикл:
 1. Загрузка конфигурации и инициализация логирования.
-2. Парсинг товаров из каталога Avito.
-3. Нормализация названий через AI (OpenRouter).
-4. Экспорт результатов в Excel для анализа цен.
+2. Парсинг объявлений аренды из каталога Avito.
+3. Детальный парсинг карточек (координаты, календарь, цены).
+4. Экспорт результатов в Excel для анализа.
 
 Запуск: python -m src
 """
@@ -20,19 +20,18 @@ from src.config import (
     set_trace_id,
     setup_logging,
 )
-from src.repositories import SQLiteProductRepository
+from src.repositories import SQLiteListingRepository
 from src.services import (
-    AIService,
     BrowserService,
     ExportService,
-    NormalizerService,
+    ListingService,
     ScraperService,
 )
 
 logger = get_logger("main")
 
 
-def create_repository(settings: Settings) -> SQLiteProductRepository:
+def create_repository(settings: Settings) -> SQLiteListingRepository:
     """Создаёт и инициализирует репозиторий.
 
     Фабричная функция (паттерн Factory) для создания
@@ -44,7 +43,7 @@ def create_repository(settings: Settings) -> SQLiteProductRepository:
     Returns:
         Инициализированный SQLite-репозиторий.
     """
-    repository = SQLiteProductRepository(
+    repository = SQLiteListingRepository(
         db_path=settings.database.db_path,
     )
     repository.initialize()
@@ -63,16 +62,32 @@ def create_browser_service(settings: Settings) -> BrowserService:
     return BrowserService(settings=settings.browser)
 
 
-def create_scraper_service(
+def create_listing_service(
     browser_service: BrowserService,
-    repository: SQLiteProductRepository,
-    settings: Settings,
-) -> ScraperService:
-    """Создаёт сервис парсинга.
+) -> ListingService:
+    """Создаёт сервис парсинга карточек объявлений.
 
     Args:
         browser_service: Сервис браузера.
-        repository: Репозиторий товаров.
+
+    Returns:
+        Экземпляр ListingService.
+    """
+    return ListingService(browser_service=browser_service)
+
+
+def create_scraper_service(
+    browser_service: BrowserService,
+    listing_service: ListingService,
+    repository: SQLiteListingRepository,
+    settings: Settings,
+) -> ScraperService:
+    """Создаёт сервис парсинга каталога.
+
+    Args:
+        browser_service: Сервис браузера.
+        listing_service: Сервис парсинга карточек.
+        repository: Репозиторий объявлений.
         settings: Настройки приложения.
 
     Returns:
@@ -80,53 +95,20 @@ def create_scraper_service(
     """
     return ScraperService(
         browser_service=browser_service,
+        listing_service=listing_service,
         repository=repository,
         settings=settings.scraper,
     )
 
 
-def create_ai_service(settings: Settings) -> AIService:
-    """Создаёт клиент AI API.
-
-    Args:
-        settings: Настройки приложения.
-
-    Returns:
-        Экземпляр AIService.
-    """
-    return AIService(settings=settings.ai)
-
-
-def create_normalizer_service(
-    ai_service: AIService,
-    repository: SQLiteProductRepository,
-    settings: Settings,
-) -> NormalizerService:
-    """Создаёт сервис нормализации.
-
-    Args:
-        ai_service: Клиент AI API.
-        repository: Репозиторий товаров.
-        settings: Настройки приложения.
-
-    Returns:
-        Экземпляр NormalizerService.
-    """
-    return NormalizerService(
-        ai_service=ai_service,
-        repository=repository,
-        ai_settings=settings.ai,
-    )
-
-
 def create_export_service(
-    repository: SQLiteProductRepository,
+    repository: SQLiteListingRepository,
     settings: Settings,
 ) -> ExportService:
     """Создаёт сервис экспорта в Excel.
 
     Args:
-        repository: Репозиторий товаров.
+        repository: Репозиторий объявлений.
         settings: Настройки приложения.
 
     Returns:
@@ -141,10 +123,9 @@ def create_export_service(
 async def run_pipeline(settings: Settings) -> None:
     """Запускает полный конвейер обработки данных.
 
-    Последовательно выполняет три этапа:
-    1. Парсинг товаров с Avito (браузер + скрапинг).
-    2. Нормализация названий через AI.
-    3. Экспорт результатов в Excel.
+    Последовательно выполняет два этапа:
+    1. Парсинг объявлений аренды с Avito (каталог + карточки).
+    2. Экспорт результатов в Excel.
 
     Гарантирует корректное закрытие всех ресурсов
     через блоки try/finally.
@@ -154,7 +135,6 @@ async def run_pipeline(settings: Settings) -> None:
     """
     repository = create_repository(settings)
     browser_service = create_browser_service(settings)
-    ai_service = create_ai_service(settings)
 
     try:
         # === ЭТАП 1: Парсинг ===
@@ -164,42 +144,28 @@ async def run_pipeline(settings: Settings) -> None:
             url=settings.scraper.category_url,
         )
 
+        listing_service = create_listing_service(
+            browser_service=browser_service,
+        )
+
         scraper_service = create_scraper_service(
             browser_service=browser_service,
+            listing_service=listing_service,
             repository=repository,
             settings=settings,
         )
 
-        raw_products = await scraper_service.scrape_all()
+        listings = await scraper_service.scrape_all()
 
-        raw_count = repository.get_raw_products_count()
+        listings_count = repository.get_listings_count()
         logger.info(
             "stage_completed",
             stage="scraping",
-            new_products=len(raw_products),
-            total_in_db=raw_count,
+            new_listings=len(listings),
+            total_in_db=listings_count,
         )
 
-        # === ЭТАП 2: AI-нормализация ===
-        logger.info("stage_started", stage="normalization")
-
-        normalizer_service = create_normalizer_service(
-            ai_service=ai_service,
-            repository=repository,
-            settings=settings,
-        )
-
-        normalized_products = await normalizer_service.normalize_all()
-
-        norm_count = repository.get_normalized_products_count()
-        logger.info(
-            "stage_completed",
-            stage="normalization",
-            new_normalized=len(normalized_products),
-            total_normalized=norm_count,
-        )
-
-        # === ЭТАП 3: Экспорт в Excel ===
+        # === ЭТАП 2: Экспорт в Excel ===
         logger.info("stage_started", stage="export")
 
         export_service = create_export_service(
@@ -218,12 +184,11 @@ async def run_pipeline(settings: Settings) -> None:
         else:
             logger.warning(
                 "export_skipped",
-                reason="no_normalized_products",
+                reason="no_listings_in_database",
             )
 
     finally:
         await browser_service.close()
-        await ai_service.close()
         repository.close()
         logger.info("all_resources_closed")
 
@@ -253,9 +218,7 @@ def main() -> None:
         "application_started",
         trace_id=trace_id,
         category_url=settings.scraper.category_url,
-        ai_model=settings.ai.model,
         max_pages=settings.scraper.max_pages,
-        batch_size=settings.ai.batch_size,
     )
 
     try:

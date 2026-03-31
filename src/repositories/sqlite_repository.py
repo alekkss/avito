@@ -1,26 +1,30 @@
-"""SQLite-реализация репозитория товаров.
+"""SQLite-реализация репозитория объявлений аренды.
 
-Хранит сырые и нормализованные товары в двух таблицах SQLite.
-Поддерживает upsert-логику (вставка или обновление по avito_id),
-батчевое сохранение и выборки для AI-нормализации.
+Хранит объявления краткосрочной аренды в таблице SQLite.
+Поддерживает upsert-логику (вставка или обновление по external_id),
+батчевое сохранение и сериализацию массивов/словарей в JSON.
 """
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from src.config import get_logger
-from src.models import NormalizedProduct, RawProduct
-from src.repositories.base import BaseProductRepository
+from src.models import RawListing, RoomCategory
+from src.repositories.base import BaseListingRepository
 
 logger = get_logger("sqlite_repository")
 
 
-class SQLiteProductRepository(BaseProductRepository):
-    """Репозиторий товаров на базе SQLite.
+class SQLiteListingRepository(BaseListingRepository):
+    """Репозиторий объявлений аренды на базе SQLite.
 
     Создаёт файл базы данных по указанному пути, автоматически
-    создаёт необходимые таблицы при инициализации.
+    создаёт необходимые таблицы при инициализации. Массивы
+    (price_60_days, calendar_60_days) и словари (события,
+    analytics_payload) сериализуются в JSON-строки.
 
     Attributes:
         _db_path: Путь к файлу базы данных.
@@ -77,56 +81,48 @@ class SQLiteProductRepository(BaseProductRepository):
         """Создаёт таблицы и индексы, если они ещё не существуют."""
         conn = self._get_connection()
 
-        create_raw_table = """
-        CREATE TABLE IF NOT EXISTS raw_products (
-            avito_id      TEXT PRIMARY KEY,
-            title         TEXT NOT NULL,
-            price         INTEGER NOT NULL,
-            url           TEXT NOT NULL,
-            description   TEXT DEFAULT '',
-            image_url     TEXT DEFAULT '',
-            seller_name   TEXT DEFAULT '',
-            seller_rating TEXT DEFAULT '',
-            seller_reviews TEXT DEFAULT '',
-            scraped_at    TEXT NOT NULL
+        create_listings_table = """
+        CREATE TABLE IF NOT EXISTS listings (
+            external_id          TEXT PRIMARY KEY,
+            latitude             REAL NOT NULL DEFAULT 0.0,
+            longitude            REAL NOT NULL DEFAULT 0.0,
+            room_category        TEXT NOT NULL DEFAULT 'Неизвестно',
+            price_60_days        TEXT NOT NULL DEFAULT '[]',
+            calendar_60_days     TEXT NOT NULL DEFAULT '[]',
+            snapshot_timestamp   TEXT NOT NULL,
+            last_host_update     TEXT,
+            min_stay             INTEGER NOT NULL DEFAULT 1,
+            is_instant_book      INTEGER NOT NULL DEFAULT 0,
+            host_rating          REAL NOT NULL DEFAULT 0.0,
+            price_change_event   TEXT,
+            booking_block_event  TEXT,
+            cancellation_event   TEXT,
+            analytics_payload    TEXT,
+            url                  TEXT DEFAULT '',
+            title                TEXT DEFAULT ''
         )
         """
 
-        create_normalized_table = """
-        CREATE TABLE IF NOT EXISTS normalized_products (
-            avito_id          TEXT PRIMARY KEY,
-            original_title    TEXT NOT NULL,
-            normalized_title  TEXT NOT NULL,
-            product_category  TEXT NOT NULL,
-            key_specs         TEXT NOT NULL,
-            price             INTEGER NOT NULL,
-            url               TEXT NOT NULL,
-            full_url          TEXT NOT NULL,
-            description       TEXT DEFAULT '',
-            image_url         TEXT DEFAULT '',
-            seller_name       TEXT DEFAULT '',
-            seller_rating     TEXT DEFAULT '',
-            seller_reviews    TEXT DEFAULT '',
-            scraped_at        TEXT NOT NULL,
-            normalized_at     TEXT NOT NULL
-        )
+        create_index_room_category = """
+        CREATE INDEX IF NOT EXISTS idx_room_category
+        ON listings (room_category)
         """
 
-        create_index_normalized_title = """
-        CREATE INDEX IF NOT EXISTS idx_normalized_title
-        ON normalized_products (normalized_title)
+        create_index_snapshot = """
+        CREATE INDEX IF NOT EXISTS idx_snapshot_timestamp
+        ON listings (snapshot_timestamp)
         """
 
-        create_index_category = """
-        CREATE INDEX IF NOT EXISTS idx_product_category
-        ON normalized_products (product_category)
+        create_index_coordinates = """
+        CREATE INDEX IF NOT EXISTS idx_coordinates
+        ON listings (latitude, longitude)
         """
 
         try:
-            conn.execute(create_raw_table)
-            conn.execute(create_normalized_table)
-            conn.execute(create_index_normalized_title)
-            conn.execute(create_index_category)
+            conn.execute(create_listings_table)
+            conn.execute(create_index_room_category)
+            conn.execute(create_index_snapshot)
+            conn.execute(create_index_coordinates)
             conn.commit()
 
             logger.info("database_initialized", db_path=self._db_path)
@@ -151,474 +147,326 @@ class SQLiteProductRepository(BaseProductRepository):
         """
         return dt.isoformat()
 
-    def _deserialize_datetime(self, value: str) -> datetime:
+    def _deserialize_datetime(self, value: str | None) -> datetime | None:
         """Десериализует ISO-строку обратно в datetime.
 
         Args:
-            value: Строка в формате ISO 8601.
+            value: Строка в формате ISO 8601 или None.
 
         Returns:
-            Объект datetime с timezone UTC.
+            Объект datetime с timezone UTC или None.
         """
+        if value is None:
+            return None
         dt = datetime.fromisoformat(value)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
 
-    def _row_to_raw_product(self, row: sqlite3.Row) -> RawProduct:
-        """Преобразует строку БД в объект RawProduct.
+    def _serialize_json(self, value: Any) -> str | None:
+        """Сериализует объект Python в JSON-строку.
+
+        Args:
+            value: Список, словарь или None.
+
+        Returns:
+            JSON-строка или None если значение None.
+        """
+        if value is None:
+            return None
+        return json.dumps(value, ensure_ascii=False)
+
+    def _deserialize_json_list(self, value: str | None) -> list[int]:
+        """Десериализует JSON-строку в список целых чисел.
+
+        Args:
+            value: JSON-строка с массивом или None.
+
+        Returns:
+            Список целых чисел. Пустой список если значение None.
+        """
+        if value is None:
+            return []
+        try:
+            result = json.loads(value)
+            if isinstance(result, list):
+                return [int(x) for x in result]
+            return []
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+    def _deserialize_json_dict(
+        self, value: str | None
+    ) -> dict[str, Any] | None:
+        """Десериализует JSON-строку в словарь.
+
+        Args:
+            value: JSON-строка со словарём или None.
+
+        Returns:
+            Словарь или None если значение None или невалидный JSON.
+        """
+        if value is None:
+            return None
+        try:
+            result = json.loads(value)
+            if isinstance(result, dict):
+                return result
+            return None
+        except json.JSONDecodeError:
+            return None
+
+    def _row_to_listing(self, row: sqlite3.Row) -> RawListing:
+        """Преобразует строку БД в объект RawListing.
 
         Args:
             row: Строка результата SQLite-запроса.
 
         Returns:
-            Экземпляр RawProduct.
+            Экземпляр RawListing.
         """
-        return RawProduct(
-            avito_id=row["avito_id"],
+        snapshot_dt = self._deserialize_datetime(row["snapshot_timestamp"])
+        if snapshot_dt is None:
+            snapshot_dt = datetime.now(timezone.utc)
+
+        return RawListing(
+            external_id=row["external_id"],
+            latitude=float(row["latitude"]),
+            longitude=float(row["longitude"]),
+            room_category=RoomCategory(row["room_category"]),
+            price_60_days=self._deserialize_json_list(row["price_60_days"]),
+            calendar_60_days=self._deserialize_json_list(
+                row["calendar_60_days"]
+            ),
+            snapshot_timestamp=snapshot_dt,
+            last_host_update=self._deserialize_datetime(
+                row["last_host_update"]
+            ),
+            min_stay=int(row["min_stay"]),
+            is_instant_book=bool(row["is_instant_book"]),
+            host_rating=float(row["host_rating"]),
+            price_change_event=self._deserialize_json_dict(
+                row["price_change_event"]
+            ),
+            booking_block_event=self._deserialize_json_dict(
+                row["booking_block_event"]
+            ),
+            cancellation_event=self._deserialize_json_dict(
+                row["cancellation_event"]
+            ),
+            analytics_payload=self._deserialize_json_dict(
+                row["analytics_payload"]
+            ),
+            url=row["url"],
             title=row["title"],
-            price=row["price"],
-            url=row["url"],
-            description=row["description"],
-            image_url=row["image_url"],
-            seller_name=row["seller_name"],
-            seller_rating=row["seller_rating"],
-            seller_reviews=row["seller_reviews"],
-            scraped_at=self._deserialize_datetime(row["scraped_at"]),
         )
 
-    def _row_to_normalized_product(
-        self, row: sqlite3.Row
-    ) -> NormalizedProduct:
-        """Преобразует строку БД в объект NormalizedProduct.
+    def _listing_to_params(self, listing: RawListing) -> tuple:
+        """Преобразует RawListing в кортеж параметров для SQL-запроса.
 
         Args:
-            row: Строка результата SQLite-запроса.
+            listing: Объявление аренды.
 
         Returns:
-            Экземпляр NormalizedProduct.
+            Кортеж значений в порядке столбцов таблицы listings.
         """
-        return NormalizedProduct(
-            avito_id=row["avito_id"],
-            original_title=row["original_title"],
-            normalized_title=row["normalized_title"],
-            product_category=row["product_category"],
-            key_specs=row["key_specs"],
-            price=row["price"],
-            url=row["url"],
-            full_url=row["full_url"],
-            description=row["description"],
-            image_url=row["image_url"],
-            seller_name=row["seller_name"],
-            seller_rating=row["seller_rating"],
-            seller_reviews=row["seller_reviews"],
-            scraped_at=self._deserialize_datetime(row["scraped_at"]),
-            normalized_at=self._deserialize_datetime(row["normalized_at"]),
+        return (
+            listing.external_id,
+            listing.latitude,
+            listing.longitude,
+            listing.room_category.value,
+            self._serialize_json(listing.price_60_days),
+            self._serialize_json(listing.calendar_60_days),
+            self._serialize_datetime(listing.snapshot_timestamp),
+            self._serialize_datetime(listing.last_host_update)
+            if listing.last_host_update
+            else None,
+            listing.min_stay,
+            1 if listing.is_instant_book else 0,
+            listing.host_rating,
+            self._serialize_json(listing.price_change_event),
+            self._serialize_json(listing.booking_block_event),
+            self._serialize_json(listing.cancellation_event),
+            self._serialize_json(listing.analytics_payload),
+            listing.url,
+            listing.title,
         )
 
-    def save_raw_product(self, product: RawProduct) -> None:
-        """Сохраняет один сырой товар (upsert по avito_id).
+    def save_listing(self, listing: RawListing) -> None:
+        """Сохраняет одно объявление (upsert по external_id).
 
         Args:
-            product: Сырой товар для сохранения.
+            listing: Объявление аренды для сохранения.
         """
         conn = self._get_connection()
 
         sql = """
-        INSERT INTO raw_products
-            (avito_id, title, price, url, description,
-             image_url, seller_name, seller_rating,
-             seller_reviews, scraped_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(avito_id) DO UPDATE SET
-            title = excluded.title,
-            price = excluded.price,
+        INSERT INTO listings
+            (external_id, latitude, longitude, room_category,
+             price_60_days, calendar_60_days, snapshot_timestamp,
+             last_host_update, min_stay, is_instant_book, host_rating,
+             price_change_event, booking_block_event, cancellation_event,
+             analytics_payload, url, title)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(external_id) DO UPDATE SET
+            latitude = excluded.latitude,
+            longitude = excluded.longitude,
+            room_category = excluded.room_category,
+            price_60_days = excluded.price_60_days,
+            calendar_60_days = excluded.calendar_60_days,
+            snapshot_timestamp = excluded.snapshot_timestamp,
+            last_host_update = excluded.last_host_update,
+            min_stay = excluded.min_stay,
+            is_instant_book = excluded.is_instant_book,
+            host_rating = excluded.host_rating,
+            price_change_event = excluded.price_change_event,
+            booking_block_event = excluded.booking_block_event,
+            cancellation_event = excluded.cancellation_event,
+            analytics_payload = excluded.analytics_payload,
             url = excluded.url,
-            description = excluded.description,
-            image_url = excluded.image_url,
-            seller_name = excluded.seller_name,
-            seller_rating = excluded.seller_rating,
-            seller_reviews = excluded.seller_reviews,
-            scraped_at = excluded.scraped_at
+            title = excluded.title
         """
 
         try:
-            conn.execute(sql, (
-                product.avito_id,
-                product.title,
-                product.price,
-                product.url,
-                product.description,
-                product.image_url,
-                product.seller_name,
-                product.seller_rating,
-                product.seller_reviews,
-                self._serialize_datetime(product.scraped_at),
-            ))
+            conn.execute(sql, self._listing_to_params(listing))
             conn.commit()
 
             logger.debug(
-                "raw_product_saved",
-                avito_id=product.avito_id,
-                title=product.title,
+                "listing_saved",
+                external_id=listing.external_id,
+                title=listing.title[:50],
             )
         except sqlite3.Error as e:
             logger.error(
-                "raw_product_save_failed",
+                "listing_save_failed",
                 exc_info=True,
-                avito_id=product.avito_id,
+                external_id=listing.external_id,
                 error=str(e),
             )
             raise
 
-    def save_raw_products(self, products: list[RawProduct]) -> None:
-        """Сохраняет список сырых товаров в одной транзакции.
+    def save_listings(self, listings: list[RawListing]) -> None:
+        """Сохраняет список объявлений в одной транзакции.
 
         Args:
-            products: Список сырых товаров.
+            listings: Список объявлений аренды.
         """
-        if not products:
+        if not listings:
             return
 
         conn = self._get_connection()
 
         sql = """
-        INSERT INTO raw_products
-            (avito_id, title, price, url, description,
-             image_url, seller_name, seller_rating,
-             seller_reviews, scraped_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(avito_id) DO UPDATE SET
-            title = excluded.title,
-            price = excluded.price,
+        INSERT INTO listings
+            (external_id, latitude, longitude, room_category,
+             price_60_days, calendar_60_days, snapshot_timestamp,
+             last_host_update, min_stay, is_instant_book, host_rating,
+             price_change_event, booking_block_event, cancellation_event,
+             analytics_payload, url, title)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(external_id) DO UPDATE SET
+            latitude = excluded.latitude,
+            longitude = excluded.longitude,
+            room_category = excluded.room_category,
+            price_60_days = excluded.price_60_days,
+            calendar_60_days = excluded.calendar_60_days,
+            snapshot_timestamp = excluded.snapshot_timestamp,
+            last_host_update = excluded.last_host_update,
+            min_stay = excluded.min_stay,
+            is_instant_book = excluded.is_instant_book,
+            host_rating = excluded.host_rating,
+            price_change_event = excluded.price_change_event,
+            booking_block_event = excluded.booking_block_event,
+            cancellation_event = excluded.cancellation_event,
+            analytics_payload = excluded.analytics_payload,
             url = excluded.url,
-            description = excluded.description,
-            image_url = excluded.image_url,
-            seller_name = excluded.seller_name,
-            seller_rating = excluded.seller_rating,
-            seller_reviews = excluded.seller_reviews,
-            scraped_at = excluded.scraped_at
+            title = excluded.title
         """
 
-        rows = [
-            (
-                p.avito_id,
-                p.title,
-                p.price,
-                p.url,
-                p.description,
-                p.image_url,
-                p.seller_name,
-                p.seller_rating,
-                p.seller_reviews,
-                self._serialize_datetime(p.scraped_at),
-            )
-            for p in products
-        ]
+        rows = [self._listing_to_params(listing) for listing in listings]
 
         try:
             conn.executemany(sql, rows)
             conn.commit()
 
             logger.info(
-                "raw_products_batch_saved",
-                count=len(products),
+                "listings_batch_saved",
+                count=len(listings),
             )
         except sqlite3.Error as e:
             logger.error(
-                "raw_products_batch_save_failed",
+                "listings_batch_save_failed",
                 exc_info=True,
-                count=len(products),
+                count=len(listings),
                 error=str(e),
             )
             raise
 
-    def get_all_raw_products(self) -> list[RawProduct]:
-        """Возвращает все сырые товары.
+    def get_all_listings(self) -> list[RawListing]:
+        """Возвращает все объявления аренды.
 
         Returns:
-            Список всех сырых товаров из таблицы raw_products.
+            Список всех объявлений, отсортированных по дате снимка.
         """
         conn = self._get_connection()
 
         try:
             cursor = conn.execute(
-                "SELECT * FROM raw_products ORDER BY scraped_at DESC"
+                "SELECT * FROM listings ORDER BY snapshot_timestamp DESC"
             )
             rows = cursor.fetchall()
-            return [self._row_to_raw_product(row) for row in rows]
+            return [self._row_to_listing(row) for row in rows]
         except sqlite3.Error as e:
             logger.error(
-                "raw_products_fetch_failed",
+                "listings_fetch_failed",
                 exc_info=True,
                 error=str(e),
             )
             raise
 
-    def get_raw_products_without_normalization(self) -> list[RawProduct]:
-        """Возвращает сырые товары без нормализации.
-
-        Находит записи в raw_products, для которых нет
-        соответствующей записи в normalized_products.
-
-        Returns:
-            Список ещё не нормализованных товаров.
-        """
-        conn = self._get_connection()
-
-        sql = """
-        SELECT r.* FROM raw_products r
-        LEFT JOIN normalized_products n ON r.avito_id = n.avito_id
-        WHERE n.avito_id IS NULL
-        ORDER BY r.scraped_at DESC
-        """
-
-        try:
-            cursor = conn.execute(sql)
-            rows = cursor.fetchall()
-
-            logger.info(
-                "unnormalized_products_fetched",
-                count=len(rows),
-            )
-            return [self._row_to_raw_product(row) for row in rows]
-        except sqlite3.Error as e:
-            logger.error(
-                "unnormalized_products_fetch_failed",
-                exc_info=True,
-                error=str(e),
-            )
-            raise
-
-    def save_normalized_product(self, product: NormalizedProduct) -> None:
-        """Сохраняет один нормализованный товар (upsert по avito_id).
+    def listing_exists(self, external_id: str) -> bool:
+        """Проверяет существование объявления по ID.
 
         Args:
-            product: Нормализованный товар.
-        """
-        conn = self._get_connection()
-
-        sql = """
-        INSERT INTO normalized_products
-            (avito_id, original_title, normalized_title,
-             product_category, key_specs, price, url, full_url,
-             description, image_url, seller_name, seller_rating,
-             seller_reviews, scraped_at, normalized_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(avito_id) DO UPDATE SET
-            original_title = excluded.original_title,
-            normalized_title = excluded.normalized_title,
-            product_category = excluded.product_category,
-            key_specs = excluded.key_specs,
-            price = excluded.price,
-            url = excluded.url,
-            full_url = excluded.full_url,
-            description = excluded.description,
-            image_url = excluded.image_url,
-            seller_name = excluded.seller_name,
-            seller_rating = excluded.seller_rating,
-            seller_reviews = excluded.seller_reviews,
-            scraped_at = excluded.scraped_at,
-            normalized_at = excluded.normalized_at
-        """
-
-        try:
-            conn.execute(sql, (
-                product.avito_id,
-                product.original_title,
-                product.normalized_title,
-                product.product_category,
-                product.key_specs,
-                product.price,
-                product.url,
-                product.full_url,
-                product.description,
-                product.image_url,
-                product.seller_name,
-                product.seller_rating,
-                product.seller_reviews,
-                self._serialize_datetime(product.scraped_at),
-                self._serialize_datetime(product.normalized_at),
-            ))
-            conn.commit()
-
-            logger.debug(
-                "normalized_product_saved",
-                avito_id=product.avito_id,
-                normalized_title=product.normalized_title,
-            )
-        except sqlite3.Error as e:
-            logger.error(
-                "normalized_product_save_failed",
-                exc_info=True,
-                avito_id=product.avito_id,
-                error=str(e),
-            )
-            raise
-
-    def save_normalized_products(
-        self, products: list[NormalizedProduct]
-    ) -> None:
-        """Сохраняет список нормализованных товаров в одной транзакции.
-
-        Args:
-            products: Список нормализованных товаров.
-        """
-        if not products:
-            return
-
-        conn = self._get_connection()
-
-        sql = """
-        INSERT INTO normalized_products
-            (avito_id, original_title, normalized_title,
-             product_category, key_specs, price, url, full_url,
-             description, image_url, seller_name, seller_rating,
-             seller_reviews, scraped_at, normalized_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(avito_id) DO UPDATE SET
-            original_title = excluded.original_title,
-            normalized_title = excluded.normalized_title,
-            product_category = excluded.product_category,
-            key_specs = excluded.key_specs,
-            price = excluded.price,
-            url = excluded.url,
-            full_url = excluded.full_url,
-            description = excluded.description,
-            image_url = excluded.image_url,
-            seller_name = excluded.seller_name,
-            seller_rating = excluded.seller_rating,
-            seller_reviews = excluded.seller_reviews,
-            scraped_at = excluded.scraped_at,
-            normalized_at = excluded.normalized_at
-        """
-
-        rows = [
-            (
-                p.avito_id,
-                p.original_title,
-                p.normalized_title,
-                p.product_category,
-                p.key_specs,
-                p.price,
-                p.url,
-                p.full_url,
-                p.description,
-                p.image_url,
-                p.seller_name,
-                p.seller_rating,
-                p.seller_reviews,
-                self._serialize_datetime(p.scraped_at),
-                self._serialize_datetime(p.normalized_at),
-            )
-            for p in products
-        ]
-
-        try:
-            conn.executemany(sql, rows)
-            conn.commit()
-
-            logger.info(
-                "normalized_products_batch_saved",
-                count=len(products),
-            )
-        except sqlite3.Error as e:
-            logger.error(
-                "normalized_products_batch_save_failed",
-                exc_info=True,
-                count=len(products),
-                error=str(e),
-            )
-            raise
-
-    def get_all_normalized_products(self) -> list[NormalizedProduct]:
-        """Возвращает все нормализованные товары.
+            external_id: Идентификатор объявления (например, "av_123").
 
         Returns:
-            Список нормализованных товаров, отсортированных по названию.
+            True если объявление найдено в таблице listings.
         """
         conn = self._get_connection()
 
         try:
             cursor = conn.execute(
-                "SELECT * FROM normalized_products "
-                "ORDER BY normalized_title, price"
-            )
-            rows = cursor.fetchall()
-            return [self._row_to_normalized_product(row) for row in rows]
-        except sqlite3.Error as e:
-            logger.error(
-                "normalized_products_fetch_failed",
-                exc_info=True,
-                error=str(e),
-            )
-            raise
-
-    def raw_product_exists(self, avito_id: str) -> bool:
-        """Проверяет существование сырого товара по ID.
-
-        Args:
-            avito_id: Идентификатор объявления Avito.
-
-        Returns:
-            True если товар найден в таблице raw_products.
-        """
-        conn = self._get_connection()
-
-        try:
-            cursor = conn.execute(
-                "SELECT 1 FROM raw_products WHERE avito_id = ? LIMIT 1",
-                (avito_id,),
+                "SELECT 1 FROM listings WHERE external_id = ? LIMIT 1",
+                (external_id,),
             )
             return cursor.fetchone() is not None
         except sqlite3.Error as e:
             logger.error(
-                "raw_product_exists_check_failed",
+                "listing_exists_check_failed",
                 exc_info=True,
-                avito_id=avito_id,
+                external_id=external_id,
                 error=str(e),
             )
             raise
 
-    def get_raw_products_count(self) -> int:
-        """Возвращает количество сырых товаров.
+    def get_listings_count(self) -> int:
+        """Возвращает количество объявлений в хранилище.
 
         Returns:
-            Число записей в таблице raw_products.
+            Число записей в таблице listings.
         """
         conn = self._get_connection()
 
         try:
             cursor = conn.execute(
-                "SELECT COUNT(*) as cnt FROM raw_products"
+                "SELECT COUNT(*) as cnt FROM listings"
             )
             row = cursor.fetchone()
             return row["cnt"] if row else 0
         except sqlite3.Error as e:
             logger.error(
-                "raw_products_count_failed",
-                exc_info=True,
-                error=str(e),
-            )
-            raise
-
-    def get_normalized_products_count(self) -> int:
-        """Возвращает количество нормализованных товаров.
-
-        Returns:
-            Число записей в таблице normalized_products.
-        """
-        conn = self._get_connection()
-
-        try:
-            cursor = conn.execute(
-                "SELECT COUNT(*) as cnt FROM normalized_products"
-            )
-            row = cursor.fetchone()
-            return row["cnt"] if row else 0
-        except sqlite3.Error as e:
-            logger.error(
-                "normalized_products_count_failed",
+                "listings_count_failed",
                 exc_info=True,
                 error=str(e),
             )

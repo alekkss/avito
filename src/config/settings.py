@@ -6,7 +6,7 @@
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,27 +29,6 @@ class ConfigValidationError(Exception):
     Выбрасывается при отсутствии обязательных переменных окружения
     или при некорректных значениях параметров.
     """
-
-
-@dataclass(frozen=True)
-class AISettings:
-    """Настройки подключения к AI API (OpenRouter).
-
-    Attributes:
-        api_url: URL эндпоинта chat completions.
-        api_key: Секретный ключ API.
-        model: Идентификатор модели AI.
-        max_retries: Максимальное число повторных попыток при ошибке.
-        retry_delay: Задержка между попытками в секундах.
-        batch_size: Количество товаров в одном запросе к AI.
-    """
-
-    api_url: str
-    api_key: str
-    model: str
-    max_retries: int
-    retry_delay: float
-    batch_size: int
 
 
 @dataclass(frozen=True)
@@ -122,7 +101,6 @@ class Settings:
     Объединяет все группы настроек в единую точку доступа.
 
     Attributes:
-        ai: Настройки AI API.
         browser: Настройки браузера.
         scraper: Настройки парсера.
         database: Настройки базы данных.
@@ -130,7 +108,6 @@ class Settings:
         log: Настройки логирования.
     """
 
-    ai: AISettings
     browser: BrowserSettings
     scraper: ScraperSettings
     database: DatabaseSettings
@@ -168,28 +145,6 @@ def _parse_int(value: str, param_name: str) -> int:
     except ValueError:
         raise ConfigValidationError(
             f"Параметр '{param_name}' должен быть целым числом, "
-            f"получено: '{value}'"
-        )
-
-
-def _parse_float(value: str, param_name: str) -> float:
-    """Преобразует строковое значение в float с валидацией.
-
-    Args:
-        value: Строка для преобразования.
-        param_name: Имя параметра для сообщения об ошибке.
-
-    Returns:
-        Числовое значение с плавающей точкой.
-
-    Raises:
-        ConfigValidationError: Если значение не является числом.
-    """
-    try:
-        return float(value)
-    except ValueError:
-        raise ConfigValidationError(
-            f"Параметр '{param_name}' должен быть числом, "
             f"получено: '{value}'"
         )
 
@@ -298,58 +253,12 @@ def load_settings() -> Settings:
 
     # --- Обязательные переменные ---
     try:
-        ai_api_key = _validate_required(
-            os.getenv("AI_API_KEY"), "AI_API_KEY"
-        )
-    except ConfigValidationError as e:
-        errors.append(str(e))
-        ai_api_key = ""
-
-    try:
         category_url = _validate_required(
             os.getenv("AVITO_CATEGORY_URL"), "AVITO_CATEGORY_URL"
         )
     except ConfigValidationError as e:
         errors.append(str(e))
         category_url = ""
-
-    # --- AI (необязательные с дефолтами) ---
-    ai_api_url = os.getenv(
-        "AI_API_URL", "https://openrouter.ai/api/v1/chat/completions"
-    )
-    ai_model = os.getenv("AI_MODEL", "qwen/qwen3.5-plus-02-15")
-
-    ai_max_retries_raw = os.getenv("AI_MAX_RETRIES", "3")
-    ai_retry_delay_raw = os.getenv("AI_RETRY_DELAY", "2.0")
-    ai_batch_size_raw = os.getenv("AI_BATCH_SIZE", "10")
-
-    try:
-        ai_max_retries = _validate_positive_int(
-            _parse_int(ai_max_retries_raw, "AI_MAX_RETRIES"),
-            "AI_MAX_RETRIES",
-        )
-    except ConfigValidationError as e:
-        errors.append(str(e))
-        ai_max_retries = 3
-
-    try:
-        ai_retry_delay = _parse_float(ai_retry_delay_raw, "AI_RETRY_DELAY")
-        if ai_retry_delay < 0:
-            raise ConfigValidationError(
-                "Параметр 'AI_RETRY_DELAY' не может быть отрицательным"
-            )
-    except ConfigValidationError as e:
-        errors.append(str(e))
-        ai_retry_delay = 2.0
-
-    try:
-        ai_batch_size = _validate_positive_int(
-            _parse_int(ai_batch_size_raw, "AI_BATCH_SIZE"),
-            "AI_BATCH_SIZE",
-        )
-    except ConfigValidationError as e:
-        errors.append(str(e))
-        ai_batch_size = 10
 
     # --- Браузер ---
     headless = _parse_bool(os.getenv("HEADLESS_MODE", "false"))
@@ -386,7 +295,7 @@ def load_settings() -> Settings:
         max_pages = 0
 
     # --- База данных ---
-    db_path = os.getenv("DB_PATH", "data/avito_products.db")
+    db_path = os.getenv("DB_PATH", "data/avito_listings.db")
 
     # --- Экспорт ---
     export_path = os.getenv("EXPORT_PATH", "data/avito_report.xlsx")
@@ -409,14 +318,6 @@ def load_settings() -> Settings:
         raise ConfigValidationError(error_message)
 
     return Settings(
-        ai=AISettings(
-            api_url=ai_api_url,
-            api_key=ai_api_key,
-            model=ai_model,
-            max_retries=ai_max_retries,
-            retry_delay=ai_retry_delay,
-            batch_size=ai_batch_size,
-        ),
         browser=BrowserSettings(
             headless=headless,
             navigation_timeout=nav_timeout,

@@ -1,13 +1,12 @@
 """Пакет доменных моделей.
 
-Предоставляет модели данных для всех этапов обработки товаров:
-    from src.models import RawProduct, NormalizedProduct, raw_to_normalized
+Предоставляет модели данных для объявлений краткосрочной аренды:
+    from src.models import RawListing, RoomCategory
 """
 
-from src.models.product import NormalizedProduct, RawProduct, raw_to_normalized
+from src.models.product import RawListing, RoomCategory
 
 __all__ = [
-    "NormalizedProduct",
-    "RawProduct",
-    "raw_to_normalized",
+    "RawListing",
+    "RoomCategory",
 ]
