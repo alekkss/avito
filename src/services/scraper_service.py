@@ -8,6 +8,7 @@
 
 import asyncio
 import random
+import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -41,13 +42,23 @@ MAX_INITIAL_NAVIGATION_RETRIES: int = 5
 # Короткий таймаут: если контейнера нет — товары закончились
 PAGINATION_CONTAINER_TIMEOUT: int = 15000
 
+# Тексты бейджа мгновенного бронирования в каталоге
+INSTANT_BOOK_BADGES: tuple[str, ...] = (
+    "мгновенная бронь",
+    "мгновенное бронирование",
+    "моментальная бронь",
+)
+
+# CSS-селектор рейтинга хоста в карточке каталога
+SELLER_SCORE_SELECTOR: str = "[data-marker='seller-info/score']"
+
 
 @dataclass
 class CatalogItem:
     """Промежуточные данные объявления из каталога.
 
-    Содержит только базовую информацию, извлечённую из списка
-    каталога. Используется как входные данные для ListingService,
+    Содержит базовую информацию, извлечённую из списка каталога.
+    Используется как входные данные для ListingService,
     который парсит детальную карточку объявления.
 
     Attributes:
@@ -55,12 +66,16 @@ class CatalogItem:
         title: Название объявления из каталога.
         price: Базовая цена из каталога (руб./сут.).
         url: Относительная ссылка на страницу объявления.
+        is_instant_book: Наличие бейджа «Мгновенная бронь» в каталоге.
+        host_rating: Рейтинг хоста из каталога (0.0 если не найден).
     """
 
     avito_id: str
     title: str
     price: int
     url: str
+    is_instant_book: bool = False
+    host_rating: float = 0.0
 
     @property
     def external_id(self) -> str:
@@ -138,12 +153,6 @@ class ScraperService:
 
     def _capture_base_url(self, url: str) -> None:
         """Запоминает базовый URL категории после первой загрузки.
-
-        Avito может добавить дополнительные параметры (context, f)
-        при первой загрузке страницы. Мы захватываем реальный URL
-        из браузера (уже с этими параметрами) и используем его
-        как базу для конструирования URL следующих страниц.
-        Параметр p удаляется — он будет подставляться отдельно.
 
         Args:
             url: Реальный URL из адресной строки браузера.
@@ -445,12 +454,6 @@ class ScraperService:
     async def scrape_all(self) -> list[RawListing]:
         """Парсит все страницы каталога и карточки объявлений.
 
-        Основной публичный метод. Работает в два этапа:
-        1. Обход каталога — собирает базовые данные (ID, URL, title, price)
-           со всех страниц пагинации.
-        2. Детальный парсинг — заходит в каждую карточку и извлекает
-           полные данные (координаты, календарь, цены на 60 дней и т.д.).
-
         Returns:
             Полный список спарсенных объявлений аренды.
         """
@@ -505,10 +508,6 @@ class ScraperService:
 
     async def _scrape_catalog(self, page: Page) -> list[CatalogItem]:
         """Обходит все страницы каталога и собирает базовые данные.
-
-        Извлекает из каждой карточки в каталоге: avito_id, title,
-        price и url. Поддерживает пагинацию, обнаружение циклов
-        и пустых страниц.
 
         Args:
             page: Активная страница Playwright.
@@ -634,10 +633,6 @@ class ScraperService:
     ) -> list[RawListing]:
         """Парсит детальные карточки всех объявлений.
 
-        Последовательно заходит в каждую карточку объявления,
-        извлекает полные данные через ListingService и сохраняет
-        в репозиторий.
-
         Args:
             page: Активная страница Playwright.
             catalog_items: Список базовых данных из каталога.
@@ -654,6 +649,8 @@ class ScraperService:
                 progress=f"{index}/{total}",
                 external_id=item.external_id,
                 title=item.title[:50],
+                is_instant_book=item.is_instant_book,
+                host_rating=item.host_rating,
             )
 
             listing = await self._listing_service.parse_listing(
@@ -662,6 +659,8 @@ class ScraperService:
                 url=item.url,
                 title=item.title,
                 base_price=item.price,
+                is_instant_book=item.is_instant_book,
+                catalog_host_rating=item.host_rating,
             )
 
             if listing is not None:
@@ -673,6 +672,8 @@ class ScraperService:
                     progress=f"{index}/{total}",
                     external_id=listing.external_id,
                     room_category=listing.room_category.value,
+                    is_instant_book=listing.is_instant_book,
+                    host_rating=listing.host_rating,
                 )
             else:
                 logger.warning(
@@ -682,7 +683,6 @@ class ScraperService:
                     url=item.url[:100],
                 )
 
-            # Каждые 10 объявлений — логируем общий прогресс
             if index % 10 == 0:
                 logger.info(
                     "detail_parsing_progress",
@@ -839,9 +839,6 @@ class ScraperService:
     ) -> list[CatalogItem]:
         """Парсит карточки объявлений на текущей странице каталога.
 
-        Извлекает только базовые данные: avito_id, title, price, url.
-        Детальный парсинг выполняется позже через ListingService.
-
         Args:
             page: Активная страница Playwright.
 
@@ -903,8 +900,8 @@ class ScraperService:
     ) -> CatalogItem | None:
         """Извлекает базовые данные объявления из карточки каталога.
 
-        Парсит только avito_id, title, price и url — минимум данных,
-        необходимых для последующего детального парсинга карточки.
+        Парсит avito_id, title, price, url, наличие бейджа
+        «Мгновенная бронь» и рейтинг хоста.
 
         Args:
             card: ElementHandle карточки объявления.
@@ -941,11 +938,48 @@ class ScraperService:
                     price_str=price_str,
                 )
 
+        # Проверяем наличие бейджа «Мгновенная бронь» в карточке
+        is_instant_book = False
+        try:
+            card_text = (await card.inner_text()).lower()
+            for badge_text in INSTANT_BOOK_BADGES:
+                if badge_text in card_text:
+                    is_instant_book = True
+                    break
+        except Exception as e:
+            logger.debug(
+                "instant_book_badge_check_failed",
+                avito_id=avito_id,
+                error=str(e),
+            )
+
+        # Извлекаем рейтинг хоста из карточки каталога
+        host_rating = 0.0
+        try:
+            score_el = await card.query_selector(SELLER_SCORE_SELECTOR)
+            if score_el:
+                score_text = (await score_el.inner_text()).strip()
+                # Заменяем запятую на точку: "4,4" → "4.4"
+                cleaned = score_text.replace(",", ".").strip()
+                match = re.search(r"(\d+\.?\d*)", cleaned)
+                if match:
+                    rating_val = float(match.group(1))
+                    if 0.0 <= rating_val <= 5.0:
+                        host_rating = rating_val
+        except Exception as e:
+            logger.debug(
+                "host_rating_extraction_failed",
+                avito_id=avito_id,
+                error=str(e),
+            )
+
         item = CatalogItem(
             avito_id=avito_id,
             title=title,
             price=price,
             url=url,
+            is_instant_book=is_instant_book,
+            host_rating=host_rating,
         )
 
         logger.debug(
@@ -953,6 +987,8 @@ class ScraperService:
             avito_id=avito_id,
             title=title[:50],
             price=price,
+            is_instant_book=is_instant_book,
+            host_rating=host_rating,
         )
 
         return item
