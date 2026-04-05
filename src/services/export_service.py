@@ -19,7 +19,6 @@ from src.repositories.base import BaseListingRepository
 
 logger = get_logger("export_service")
 
-
 # Определение столбцов отчёта: (заголовок, ширина в символах)
 REPORT_COLUMNS: list[tuple[str, int]] = [
     ("ID объявления", 18),
@@ -33,7 +32,7 @@ REPORT_COLUMNS: list[tuple[str, int]] = [
     ("Мгновенное бронирование", 22),
     ("Рейтинг хоста", 14),
     ("Последнее обновление хостом", 26),
-    ("Цены 60 дней", 40),
+    ("Цены 60 дней", 80),       # увеличено: 60 значений через ";"
     ("Календарь 60 дней", 40),
     ("Ссылка", 55),
     ("Дата снимка", 20),
@@ -248,7 +247,7 @@ class ExportService:
                 "%Y-%m-%d %H:%M"
             )
 
-        prices_str = self._format_array_short(listing.price_60_days)
+        prices_str = self._format_array_semicolon(listing.price_60_days)
         calendar_str = self._format_calendar_short(listing.calendar_60_days)
 
         return [
@@ -269,35 +268,28 @@ class ExportService:
             snapshot_date,
         ]
 
-    def _format_array_short(self, values: list[int]) -> str:
-        """Форматирует массив цен в компактную строку.
+    def _format_array_semicolon(self, values: list[int]) -> str:
+        """Форматирует массив цен в строку через точку с запятой.
 
-        Показывает первые 7 значений и общее количество.
-        Например: "3500, 3500, 4000, 4000, 5000, 3500, 3500... (60)"
+        Все 60 значений выводятся в одну строку через «;».
+        Занятые дни имеют значение 0, свободные — реальную цену.
+        Пример: «0;0;0;5500;5500;4800;0;5500;...»
 
         Args:
-            values: Массив целых чисел (цены).
+            values: Массив целых чисел (цены на 60 дней).
 
         Returns:
-            Компактная строковая запись массива.
+            Строка всех значений через «;» или «—» если пусто.
         """
         if not values:
             return "—"
-
-        preview_count = 7
-        preview = [str(v) for v in values[:preview_count]]
-        result = ", ".join(preview)
-
-        if len(values) > preview_count:
-            result += f"... ({len(values)})"
-
-        return result
+        return ";".join(str(v) for v in values)
 
     def _format_calendar_short(self, values: list[int]) -> str:
         """Форматирует массив занятости в компактную строку.
 
         Показывает первые 14 дней как последовательность 0/1.
-        Например: "00011100001110... (60)"
+        Например: «00011100001110... (60)»
 
         Args:
             values: Массив 0/1 (занятость).
