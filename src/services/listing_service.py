@@ -12,7 +12,7 @@ import asyncio
 import json
 import random
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from playwright.async_api import Page
 
@@ -519,6 +519,9 @@ class ListingService:
         с data-marker="datepicker/content". Листает месяцы
         вперёд кнопкой next для сбора 60 дней.
 
+        Важно: дни раньше сегодняшней даты отфильтровываются,
+        чтобы массив calendar начинался строго с текущего дня.
+
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
@@ -544,11 +547,12 @@ class ListingService:
             return result
 
         # --- Шаг 2: Парсим видимые месяцы и листаем вперёд ---
-        all_days: list[int] = []
+        today = date.today()
+        all_days: list[dict] = []
         months_switched = 0
 
-        while len(all_days) < CALENDAR_DAYS_TARGET:
-            new_days = await self._parse_visible_calendar_days(
+        while len(all_days) < CALENDAR_DAYS_TARGET + 31:
+            new_days = await self._parse_visible_calendar_days_raw(
                 page, external_id
             )
 
@@ -571,9 +575,6 @@ class ListingService:
                 months_switched=months_switched,
             )
 
-            if len(all_days) >= CALENDAR_DAYS_TARGET:
-                break
-
             if months_switched >= MAX_MONTH_SWITCHES:
                 logger.debug(
                     "datepicker_max_month_switches_reached",
@@ -595,8 +596,30 @@ class ListingService:
             months_switched += 1
             await asyncio.sleep(random.uniform(0.5, 1.0))
 
-        # Обрезаем до 60 дней
-        result["calendar"] = all_days[:CALENDAR_DAYS_TARGET]
+        # --- Шаг 2.1: Фильтрация — только дни начиная с сегодня ---
+        filtered_bits: list[int] = []
+        for day_info in all_days:
+            try:
+                day_date = date(
+                    day_info["year"],
+                    day_info["month"],
+                    day_info["day"],
+                )
+            except (ValueError, KeyError):
+                continue
+
+            if day_date < today:
+                continue
+
+            if day_info.get("disabled", False):
+                filtered_bits.append(1)
+            else:
+                filtered_bits.append(0)
+
+            if len(filtered_bits) >= CALENDAR_DAYS_TARGET:
+                break
+
+        result["calendar"] = filtered_bits[:CALENDAR_DAYS_TARGET]
 
         logger.info(
             "calendar_extracted_from_datepicker",
@@ -604,6 +627,7 @@ class ListingService:
             total_days=len(result["calendar"]),
             occupied_days=sum(result["calendar"]),
             months_switched=months_switched,
+            first_date=str(today),
         )
 
         # --- Шаг 3: Извлекаем мин. срок ---
@@ -717,17 +741,22 @@ class ListingService:
         )
         return False
 
-    async def _parse_visible_calendar_days(
+    async def _parse_visible_calendar_days_raw(
         self, page: Page, external_id: str
-    ) -> list[int]:
+    ) -> list[dict]:
         """Парсит все видимые дни из открытого datepicker.
+
+        Возвращает сырые данные с годом, месяцем, днём и
+        флагом disabled для каждого дня. Фильтрация по дате
+        выполняется вызывающим кодом.
 
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
 
         Returns:
-            Список 0/1 для каждого дня видимых месяцев.
+            Список словарей с ключами year, month, day, disabled.
+            Месяц — 1-indexed (1=январь, 12=декабрь).
         """
         js_parse_days = """
         () => {
@@ -804,22 +833,25 @@ class ListingService:
         except (KeyError, TypeError):
             sorted_days = raw_days
 
-        calendar_bits: list[int] = []
-        for day_info in sorted_days:
-            if day_info.get("disabled", False):
-                calendar_bits.append(1)
-            else:
-                calendar_bits.append(0)
-
         logger.debug(
-            "datepicker_visible_days_parsed",
+            "datepicker_visible_days_parsed_raw",
             external_id=external_id,
-            total_days=len(calendar_bits),
-            occupied=sum(calendar_bits),
-            free=len(calendar_bits) - sum(calendar_bits),
+            total_days=len(sorted_days),
+            first_day=(
+                f"{sorted_days[0]['year']}-"
+                f"{sorted_days[0]['month']:02d}-"
+                f"{sorted_days[0]['day']:02d}"
+                if sorted_days else "none"
+            ),
+            last_day=(
+                f"{sorted_days[-1]['year']}-"
+                f"{sorted_days[-1]['month']:02d}-"
+                f"{sorted_days[-1]['day']:02d}"
+                if sorted_days else "none"
+            ),
         )
 
-        return calendar_bits
+        return sorted_days
 
     async def _click_next_month(
         self, page: Page, external_id: str

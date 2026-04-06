@@ -1,14 +1,13 @@
-"""Тестовый скрипт для парсинга одного объявления.
+"""Тестовый скрипт для парсинга одного объявления по прямой ссылке.
 
-Прогоняет полный pipeline проекта (каталог → карточка → БД → Excel),
-но обрабатывает только первое объявление из каталога.
-Дополнительно извлекает реальные цены на свободные дни через
-датепикер (заезд → чтение мин. срока → выезд → цена).
-Использует отдельную тестовую БД и отдельный Excel-файл,
-чтобы не затрагивать основные данные.
+Переходит напрямую на страницу конкретного объявления Avito
+(без обхода каталога), извлекает все детальные данные карточки
+(координаты, календарь, мин. срок, рейтинг, мгновенное бронирование),
+затем извлекает реальные цены через датепикер для каждого свободного
+дня и экспортирует результат в отдельные тестовую БД и Excel-файл.
 
 Запуск:
-    python scripts/test_single_listing.py
+    python scripts/test_direct_listing.py
 """
 
 import asyncio
@@ -23,37 +22,100 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from playwright.async_api import Page
 
 from src.config import (
-    ConfigValidationError,
+    BrowserSettings,
     ExportSettings,
-    Settings,
     get_logger,
-    load_settings,
-    set_trace_id,
     setup_logging,
+    set_trace_id,
 )
 from src.repositories import SQLiteListingRepository
-from src.services import (
-    BrowserService,
-    ExportService,
-    ListingService,
-    ScraperService,
+from src.services import BrowserService, ExportService, ListingService
+
+# ============================================================
+# Настройки тестового скрипта
+# ============================================================
+
+# Прямая ссылка на объявление Avito (без дублирования)
+DIRECT_LISTING_URL: str = (
+    "https://www.avito.ru/sankt-peterburg/kvartiry/"
+    "kvartira-studiya_28_m_1_krovat_2171665897"
 )
 
 # Пути к тестовым файлам (отдельно от основных)
-TEST_DB_PATH = "data/test_single_listing.db"
-TEST_EXPORT_PATH = "data/test_single_listing.xlsx"
+TEST_DB_PATH: str = "data/test_direct_listing.db"
+TEST_EXPORT_PATH: str = "data/test_direct_listing.xlsx"
 
 # Таймаут ожидания датепикера после клика (мс)
 DATEPICKER_OPEN_TIMEOUT: int = 5000
+
 # Максимальное количество переключений месяцев при навигации вперёд
 MAX_MONTH_SWITCHES: int = 4
 
-logger = get_logger("test_single_listing")
+logger = get_logger("test_direct_listing")
 
 
-# ==================================================================
-# Вспомогательные функции: работа с датепикером и ценой
-# ==================================================================
+# ============================================================
+# Вспомогательные функции: ID из URL
+# ============================================================
+
+
+def _extract_avito_id_from_url(url: str) -> str:
+    """Извлекает числовой ID объявления из URL Avito.
+
+    Avito URL заканчивается на «_<числовой_id>», например:
+    «kvartira-studiya_28_m_1_krovat_2171665897» → «2171665897».
+
+    Args:
+        url: Полный или относительный URL объявления Avito.
+
+    Returns:
+        Строка external_id в формате «av_<числовой_id>».
+
+    Raises:
+        ValueError: Если не удалось извлечь ID из URL.
+    """
+    match = re.search(r"_(\d{5,15})(?:\?|$)", url)
+    if match:
+        return f"av_{match.group(1)}"
+
+    # Фоллбэк: ищем любую длинную последовательность цифр
+    match_fallback = re.search(r"(\d{7,15})", url)
+    if match_fallback:
+        return f"av_{match_fallback.group(1)}"
+
+    raise ValueError(
+        f"Не удалось извлечь ID объявления из URL: {url}"
+    )
+
+
+def _extract_title_from_url(url: str) -> str:
+    """Извлекает приблизительное название из URL.
+
+    Берёт последний сегмент пути URL и преобразует
+    подчёркивания и дефисы в пробелы.
+
+    Args:
+        url: URL объявления.
+
+    Returns:
+        Человекочитаемое название (приблизительное).
+    """
+    from urllib.parse import urlparse
+
+    path = urlparse(url).path.rstrip("/")
+    last_segment = path.split("/")[-1] if "/" in path else path
+
+    # Убираем числовой ID в конце
+    cleaned = re.sub(r"_\d{5,15}$", "", last_segment)
+    # Заменяем разделители на пробелы
+    cleaned = cleaned.replace("_", " ").replace("-", " ")
+
+    return cleaned.strip().capitalize() or "Объявление Avito"
+
+
+# ============================================================
+# Вспомогательные функции: работа с датепикером
+# ============================================================
 
 
 async def _open_datepicker(page: Page) -> bool:
@@ -174,9 +236,6 @@ async def _click_day(
 ) -> bool:
     """Кликает на доступный день в видимом месяце датепикера.
 
-    Ищет ячейку с data-marker="datepicker-day-available" внутри
-    нужного календарного блока, совпадающую по числу.
-
     Args:
         target_year: Год.
         target_month: Месяц (1-12).
@@ -231,14 +290,9 @@ async def _read_min_stay_from_datepicker(
     текст вида «Бронь минимум от N суток» (или «ночей», «дней»).
     Функция извлекает число N из этого текста.
 
-    Если текст не найден или не удалось распарсить — возвращает
-    переданный default_min_stay как фоллбэк.
-
     Args:
-        page: Активная страница Playwright (датепикер должен быть
-              открыт, дата заезда уже кликнута).
-        default_min_stay: Фоллбэк-значение мин. срока (из парсинга
-                          карточки объявления).
+        page: Активная страница Playwright.
+        default_min_stay: Фоллбэк-значение мин. срока.
 
     Returns:
         Минимальный срок аренды в сутках.
@@ -280,9 +334,6 @@ async def _read_min_stay_from_datepicker(
 async def _read_item_price(page: Page) -> int | None:
     """Читает текущую цену из span[data-marker='item-view/item-price'].
 
-    Берёт значение атрибута content (числовое, без форматирования).
-    Пример: <span content="4000" data-marker="item-view/item-price">
-
     Returns:
         Цена в рублях или None если элемент не найден.
     """
@@ -301,9 +352,62 @@ async def _read_item_price(page: Page) -> int | None:
     return None
 
 
-# ==================================================================
-# Основная функция извлечения цен
-# ==================================================================
+async def _read_base_price(page: Page) -> int:
+    """Читает базовую цену со страницы карточки до работы с датепикером.
+
+    Пробует несколько источников: атрибут content элемента цены,
+    текст элемента цены, __initialData__.
+
+    Args:
+        page: Активная страница на карточке объявления.
+
+    Returns:
+        Базовая цена в рублях (0 если не удалось прочитать).
+    """
+    # Способ 1: атрибут content
+    price = await _read_item_price(page)
+    if price is not None:
+        return price
+
+    # Способ 2: текст элемента цены
+    try:
+        price_el = await page.query_selector(
+            "[data-marker='item-view/item-price']"
+        )
+        if price_el:
+            text = (await price_el.inner_text()).strip()
+            digits = re.sub(r"[^\d]", "", text)
+            if digits:
+                return int(digits)
+    except Exception:
+        pass
+
+    # Способ 3: __initialData__
+    try:
+        js_price = await page.evaluate("""
+            () => {
+                try {
+                    const data = window.__initialData__;
+                    if (data) {
+                        const text = JSON.stringify(data);
+                        const match = text.match(/"price":\\s*(\\d+)/);
+                        if (match) return parseInt(match[1]);
+                    }
+                } catch (e) {}
+                return 0;
+            }
+        """)
+        if js_price and js_price > 0:
+            return js_price
+    except Exception:
+        pass
+
+    return 0
+
+
+# ============================================================
+# Извлечение реальных цен через датепикер
+# ============================================================
 
 
 async def extract_prices_for_free_days(
@@ -318,8 +422,7 @@ async def extract_prices_for_free_days(
     1. Открывает датепикер.
     2. Навигирует до месяца даты заезда.
     3. Кликает на дату заезда (check-in).
-    4. Читает минимальный срок из текста датепикера
-       (например, «Бронь минимум от 2 суток»).
+    4. Читает минимальный срок из текста датепикера.
     5. Вычисляет дату выезда = заезд + мин. срок из датепикера.
     6. Навигирует до месяца выезда, кликает дату выезда.
     7. Читает цену из span[data-marker='item-view/item-price'].
@@ -328,13 +431,11 @@ async def extract_prices_for_free_days(
     Занятые дни получают цену 0.
 
     Args:
-        page: Активная страница Playwright (должна быть на странице
-              карточки объявления).
+        page: Активная страница Playwright.
         calendar_60_days: Массив занятости 60 дней (0 — свободен,
                           1 — занят).
-        default_min_stay: Фоллбэк мин. срока аренды (используется,
-                          если из датепикера не удалось прочитать).
-        base_price: Цена-фоллбэк из каталога при ошибке чтения.
+        default_min_stay: Фоллбэк мин. срока аренды.
+        base_price: Цена-фоллбэк из карточки при ошибке чтения.
 
     Returns:
         Массив цен на 60 дней: 0 для занятых, реальная цена для
@@ -452,185 +553,169 @@ async def extract_prices_for_free_days(
     return prices
 
 
-# ==================================================================
+# ============================================================
 # Основной конвейер
-# ==================================================================
+# ============================================================
 
 
-async def run_test_pipeline(settings: Settings) -> None:
-    """Запускает тестовый конвейер: парсинг одного объявления.
+async def run_direct_pipeline() -> None:
+    """Запускает конвейер парсинга одного объявления по прямой ссылке.
 
     Этапы:
-    1. Открывает браузер и переходит на каталог Avito.
-    2. Парсит карточки на первой странице каталога.
-    3. Берёт только первое объявление.
-    4. Заходит в карточку и извлекает базовые данные (координаты,
-       календарь, мин. срок, рейтинг).
-    5. Извлекает реальные цены через датепикер с динамическим
-       определением мин. срока для каждой даты.
-    6. Обновляет listing.price_60_days реальными ценами.
-    7. Сохраняет в тестовую БД SQLite.
-    8. Экспортирует в тестовый Excel-файл.
-
-    Args:
-        settings: Валидированные настройки приложения.
+    1. Запускает браузер и переходит на страницу объявления.
+    2. Извлекает базовую цену со страницы.
+    3. Извлекает все детальные данные через ListingService.
+    4. Извлекает реальные цены через датепикер.
+    5. Сохраняет в тестовую БД SQLite.
+    6. Экспортирует в тестовый Excel-файл.
     """
+    # --- Извлекаем ID и название из URL ---
+    try:
+        external_id = _extract_avito_id_from_url(DIRECT_LISTING_URL)
+    except ValueError as e:
+        print(f"\n[ОШИБКА] {e}")
+        return
+
+    approx_title = _extract_title_from_url(DIRECT_LISTING_URL)
+
+    print(f"\n{'=' * 60}")
+    print("Целевое объявление:")
+    print(f"  URL:         {DIRECT_LISTING_URL}")
+    print(f"  External ID: {external_id}")
+    print(f"  Название:    {approx_title} (приблизительно из URL)")
+    print(f"{'=' * 60}\n")
+
+    # --- Подготовка инфраструктуры ---
+    browser_settings = BrowserSettings(
+        headless=False,
+        navigation_timeout=90000,
+        page_wait_time=30000,
+    )
+
     repository = SQLiteListingRepository(db_path=TEST_DB_PATH)
     repository.initialize()
 
-    browser_service = BrowserService(settings=settings.browser)
+    browser_service = BrowserService(settings=browser_settings)
 
     try:
         # === ЭТАП 1: Запуск браузера и навигация ===
         logger.info(
-            "test_stage_started",
-            stage="browser_launch",
-            url=settings.scraper.category_url,
+            "direct_test_started",
+            url=DIRECT_LISTING_URL,
+            external_id=external_id,
         )
+        print("[этап 1] Запуск браузера и навигация на объявление...")
 
         page = await browser_service.launch()
 
-        success = await browser_service.navigate(
-            settings.scraper.category_url
-        )
+        success = await browser_service.navigate(DIRECT_LISTING_URL)
         if not success:
             logger.error(
-                "test_navigation_failed",
-                url=settings.scraper.category_url,
+                "direct_test_navigation_failed",
+                url=DIRECT_LISTING_URL,
             )
-            print("\n[ОШИБКА] Не удалось загрузить страницу каталога Avito.")
+            print("\n[ОШИБКА] Не удалось загрузить страницу объявления.")
             print("Возможные причины:")
             print("  - Avito заблокировал доступ (CAPTCHA)")
-            print("  - Некорректный URL в AVITO_CATEGORY_URL")
+            print("  - Объявление удалено или недоступно")
             print("  - Проблемы с интернет-соединением")
             return
 
         await browser_service.simulate_human_behavior()
-        logger.info("test_stage_completed", stage="browser_launch")
+        print("[этап 1] Страница объявления загружена успешно.\n")
 
-        # === ЭТАП 2: Парсинг первой страницы каталога ===
-        logger.info("test_stage_started", stage="catalog_parse")
+        # === ЭТАП 2: Чтение базовой цены со страницы ===
+        print("[этап 2] Чтение базовой цены со страницы...")
+
+        base_price = await _read_base_price(page)
+        if base_price > 0:
+            print(f"  Базовая цена: {base_price} руб./сут.")
+        else:
+            base_price = 1
+            print(
+                "  Базовая цена не найдена → используется заглушка 1 руб."
+            )
+
+        # Читаем реальное название со страницы (если доступно)
+        real_title = approx_title
+        try:
+            title_el = await page.query_selector(
+                "[data-marker='item-view/title-info'] h1,"
+                "h1[data-marker='item-view/title'],"
+                "h1[itemprop='name'],"
+                "h1"
+            )
+            if title_el:
+                real_title = (await title_el.inner_text()).strip()
+                print(f"  Название:     {real_title}")
+        except Exception:
+            print(f"  Название:     {approx_title} (из URL)")
+
+        # === ЭТАП 3: Детальный парсинг карточки через ListingService ===
+        print("\n[этап 3] Парсинг карточки объявления (ListingService)...")
 
         listing_service = ListingService(browser_service=browser_service)
-        scraper_service = ScraperService(
-            browser_service=browser_service,
-            listing_service=listing_service,
-            repository=repository,
-            settings=settings.scraper,
+
+        # Извлекаем относительный URL для ListingService
+        relative_url = DIRECT_LISTING_URL.replace(
+            "https://www.avito.ru", ""
         )
-
-        catalog_items = await scraper_service._parse_current_page(page)
-
-        if not catalog_items:
-            logger.error("test_no_catalog_items")
-            print(
-                "\n[ОШИБКА] На странице каталога не найдено "
-                "ни одного объявления."
-            )
-            print("Возможные причины:")
-            print("  - Avito показала CAPTCHA или заглушку")
-            print("  - Изменились CSS-селекторы каталога")
-            print("  - Страница не успела загрузиться")
-            return
-
-        first_item = catalog_items[0]
-
-        logger.info(
-            "test_first_item_selected",
-            avito_id=first_item.avito_id,
-            title=first_item.title[:80],
-            price=first_item.price,
-            url=first_item.url[:100],
-            is_instant_book=first_item.is_instant_book,
-            host_rating=first_item.host_rating,
-        )
-
-        print(f"\n{'=' * 60}")
-        print(f"Найдено объявлений на странице: {len(catalog_items)}")
-        print("Выбрано первое объявление:")
-        print(f"  ID:              {first_item.avito_id}")
-        print(f"  Название:        {first_item.title}")
-        print(f"  Цена (каталог):  {first_item.price} руб./сут.")
-        print(
-            f"  Мгновенная бронь:"
-            f" {'Да' if first_item.is_instant_book else 'Нет'}"
-        )
-        print(f"  Рейтинг:         {first_item.host_rating}")
-        print(f"  Ссылка:          https://www.avito.ru{first_item.url}")
-        print(f"{'=' * 60}\n")
-
-        # === ЭТАП 3: Детальный парсинг карточки ===
-        logger.info(
-            "test_stage_started",
-            stage="listing_detail_parse",
-            external_id=first_item.external_id,
-        )
+        # Убираем query-параметры
+        if "?" in relative_url:
+            relative_url = relative_url.split("?")[0]
 
         listing = await listing_service.parse_listing(
             page=page,
-            external_id=first_item.external_id,
-            url=first_item.url,
-            title=first_item.title,
-            base_price=first_item.price,
-            is_instant_book=first_item.is_instant_book,
-            catalog_host_rating=first_item.host_rating,
+            external_id=external_id,
+            url=relative_url,
+            title=real_title,
+            base_price=base_price,
+            is_instant_book=False,
+            catalog_host_rating=0.0,
         )
 
         if listing is None:
             logger.error(
-                "test_listing_parse_failed",
-                external_id=first_item.external_id,
+                "direct_test_listing_parse_failed",
+                external_id=external_id,
             )
-            print("[ОШИБКА] Не удалось спарсить карточку объявления.")
+            print("\n[ОШИБКА] Не удалось спарсить карточку объявления.")
             print("Возможные причины:")
             print("  - Avito заблокировала доступ к карточке")
             print("  - Страница объявления не загрузилась")
             print("  - Изменилась структура карточки объявления")
             return
 
-        logger.info(
-            "test_stage_completed",
-            stage="listing_detail_parse",
-            external_id=listing.external_id,
-            room_category=listing.room_category.value,
-            latitude=listing.latitude,
-            longitude=listing.longitude,
-            avg_price=round(listing.average_price),
-            occupancy=f"{listing.occupancy_rate:.0%}",
-            min_stay=listing.min_stay,
-            is_instant_book=listing.is_instant_book,
-            host_rating=listing.host_rating,
-        )
-
-        print("Результаты парсинга карточки:")
-        print(f"  External ID:      {listing.external_id}")
-        print(f"  Категория жилья:  {listing.room_category.value}")
-        print(f"  Координаты:       {listing.latitude}, {listing.longitude}")
-        print(f"  Мин. срок:        {listing.min_stay} сут.")
-        print(f"  Занятость:        {listing.occupancy_rate:.1%}")
+        print(f"\n  Результаты парсинга карточки:")
+        print(f"    External ID:      {listing.external_id}")
+        print(f"    Название:         {listing.title}")
+        print(f"    Категория жилья:  {listing.room_category.value}")
         print(
-            f"  Мгновенная бронь: "
+            f"    Координаты:       "
+            f"{listing.latitude}, {listing.longitude}"
+        )
+        print(f"    Мин. срок:        {listing.min_stay} сут.")
+        print(f"    Занятость:        {listing.occupancy_rate:.1%}")
+        print(
+            f"    Мгновенная бронь: "
             f"{'Да' if listing.is_instant_book else 'Нет'}"
         )
-        print(f"  Рейтинг хоста:    {listing.host_rating}")
+        print(f"    Рейтинг хоста:    {listing.host_rating}")
         print(
-            f"  Последнее обновление: "
+            f"    Последнее обновление: "
             f"{listing.last_host_update or 'Не найдено'}"
         )
-        print(f"  Цены (фоллбэк, 7): {listing.price_60_days[:7]}")
-        print(f"  Календарь (14):    {listing.calendar_60_days[:14]}")
+        print(f"    Цены (фоллбэк, 7): {listing.price_60_days[:7]}")
+        print(f"    Календарь (14):    {listing.calendar_60_days[:14]}")
 
-        # === ЭТАП 4: Реальные цены через датепикер ===
-        logger.info(
-            "test_stage_started",
-            stage="price_extraction",
-            external_id=listing.external_id,
-            default_min_stay=listing.min_stay,
-            free_days=listing.calendar_60_days.count(0),
+        # === ЭТАП 4: Возврат на страницу объявления для датепикера ===
+        #
+        # ListingService.parse_listing() делает page.goto() внутри,
+        # поэтому мы уже на странице карточки. Но на всякий случай
+        # убеждаемся, что находимся на нужной странице.
+        print(
+            f"\n[этап 4] Извлечение реальных цен через датепикер..."
         )
-
-        print(f"\n{'=' * 60}")
-        print("Этап: извлечение реальных цен через датепикер")
         print(
             f"  Фоллбэк мин. срока (из карточки): "
             f"{listing.min_stay} сут."
@@ -640,47 +725,60 @@ async def run_test_pipeline(settings: Settings) -> None:
             "из датепикера индивидуально"
         )
 
+        # Проверяем, что мы на странице карточки
+        current_url = page.url
+        if external_id.replace("av_", "") not in current_url:
+            print(
+                "  Переход обратно на страницу объявления..."
+            )
+            await page.goto(
+                DIRECT_LISTING_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            await asyncio.sleep(3.0)
+
         real_prices = await extract_prices_for_free_days(
             page=page,
             calendar_60_days=listing.calendar_60_days,
             default_min_stay=listing.min_stay,
-            base_price=first_item.price,
+            base_price=base_price,
         )
 
         # Обновляем цены в объекте listing
         listing.price_60_days = real_prices
 
         logger.info(
-            "test_stage_completed",
-            stage="price_extraction",
+            "direct_test_prices_extracted",
             external_id=listing.external_id,
             prices_filled=sum(1 for p in real_prices if p > 0),
             avg_price=round(listing.average_price),
         )
 
-        print(f"\nЦены обновлены в listing:")
-        print(f"  Средняя цена:    {round(listing.average_price)} руб./сут.")
-        print(f"  Цены (первые 7): {listing.price_60_days[:7]}")
-        print(f"{'=' * 60}\n")
+        print(f"\n  Цены обновлены:")
+        print(
+            f"    Средняя цена:    "
+            f"{round(listing.average_price)} руб./сут."
+        )
+        print(f"    Цены (первые 14): {listing.price_60_days[:14]}")
 
         # === ЭТАП 5: Сохранение в тестовую БД ===
-        logger.info("test_stage_started", stage="database_save")
+        print(f"\n[этап 5] Сохранение в тестовую БД...")
 
         repository.save_listing(listing)
 
         db_count = repository.get_listings_count()
         logger.info(
-            "test_stage_completed",
-            stage="database_save",
+            "direct_test_saved_to_db",
+            external_id=listing.external_id,
             total_in_db=db_count,
         )
         print(
-            f"Сохранено в тестовую БД: {TEST_DB_PATH} "
-            f"(записей: {db_count})"
+            f"  Сохранено: {TEST_DB_PATH} (записей: {db_count})"
         )
 
         # === ЭТАП 6: Экспорт в тестовый Excel ===
-        logger.info("test_stage_started", stage="excel_export")
+        print(f"\n[этап 6] Экспорт в Excel...")
 
         test_export_settings = ExportSettings(
             export_path=TEST_EXPORT_PATH,
@@ -693,66 +791,73 @@ async def run_test_pipeline(settings: Settings) -> None:
 
         if export_path:
             logger.info(
-                "test_stage_completed",
-                stage="excel_export",
+                "direct_test_exported",
                 file_path=export_path,
             )
-            print(f"Excel-файл создан: {export_path}")
+            print(f"  Excel-файл создан: {export_path}")
         else:
-            logger.warning("test_export_no_data")
-            print("[ПРЕДУПРЕЖДЕНИЕ] Excel-файл не создан — нет данных.")
+            print(
+                "  [ПРЕДУПРЕЖДЕНИЕ] Excel-файл не создан — нет данных."
+            )
 
+        # === Итоговый отчёт ===
         print(f"\n{'=' * 60}")
         print("Тестовый прогон завершён успешно!")
+        print(f"  Объявление: {listing.title[:60]}")
+        print(f"  External ID: {listing.external_id}")
+        print(
+            f"  Средняя цена: "
+            f"{round(listing.average_price)} руб./сут."
+        )
+        print(f"  Занятость: {listing.occupancy_rate:.1%}")
+        print(f"  Мин. срок: {listing.min_stay} сут.")
         print(f"  БД:    {Path(TEST_DB_PATH).resolve()}")
         if export_path:
-            print(f"  Excel: {export_path}")
+            print(f"  Excel: {Path(export_path).resolve()}")
         print(f"{'=' * 60}")
 
     finally:
         await browser_service.close()
         repository.close()
-        logger.info("test_all_resources_closed")
+        logger.info("direct_test_resources_closed")
+
+
+# ============================================================
+# Точка входа
+# ============================================================
 
 
 def main() -> None:
     """Главная функция тестового скрипта.
 
-    Загружает конфигурацию из .env, настраивает логирование
-    и запускает тестовый конвейер с одним объявлением.
+    Настраивает логирование и запускает конвейер парсинга
+    одного объявления по прямой ссылке.
     """
-    print("\n=== Avito Parser — тестовый прогон (одно объявление) ===\n")
-
-    try:
-        settings = load_settings()
-    except ConfigValidationError as e:
-        print(f"\n[ОШИБКА КОНФИГУРАЦИИ]\n{e}")
-        print("\nПроверьте файл .env (см. .env.example для справки).")
-        sys.exit(1)
-
-    setup_logging(
-        level=settings.log.level,
-        log_file_path=settings.log.file_path,
+    print(
+        "\n=== Avito Parser — тестовый прогон "
+        "(прямая ссылка на объявление) ===\n"
     )
+
+    setup_logging(level="DEBUG", log_file_path="")
 
     trace_id = set_trace_id()
 
     logger.info(
-        "test_application_started",
+        "direct_test_application_started",
         trace_id=trace_id,
-        category_url=settings.scraper.category_url,
-        test_db_path=TEST_DB_PATH,
-        test_export_path=TEST_EXPORT_PATH,
+        url=DIRECT_LISTING_URL,
+        test_db=TEST_DB_PATH,
+        test_export=TEST_EXPORT_PATH,
     )
 
     try:
-        asyncio.run(run_test_pipeline(settings))
+        asyncio.run(run_direct_pipeline())
     except KeyboardInterrupt:
-        logger.info("test_interrupted_by_user")
-        print("\nТестовый скрипт остановлен пользователем (Ctrl+C).")
+        logger.info("direct_test_interrupted")
+        print("\nСкрипт остановлен пользователем (Ctrl+C).")
     except Exception as e:
         logger.critical(
-            "test_fatal_error",
+            "direct_test_fatal_error",
             exc_info=True,
             error=str(e),
             error_type=type(e).__name__,
@@ -760,7 +865,7 @@ def main() -> None:
         print(f"\nКритическая ошибка: {e}")
         sys.exit(1)
 
-    logger.info("test_application_finished", trace_id=trace_id)
+    logger.info("direct_test_application_finished", trace_id=trace_id)
 
 
 if __name__ == "__main__":
