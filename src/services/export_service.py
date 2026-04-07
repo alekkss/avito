@@ -32,8 +32,8 @@ REPORT_COLUMNS: list[tuple[str, int]] = [
     ("Мгновенное бронирование", 22),
     ("Рейтинг хоста", 14),
     ("Последнее обновление хостом", 26),
-    ("Цены 60 дней", 80),       # увеличено: 60 значений через ";"
-    ("Календарь 60 дней", 40),
+    ("Цены 60 дней", 80),
+    ("Календарь 60 дней", 80),
     ("Ссылка", 55),
     ("Дата снимка", 20),
 ]
@@ -248,7 +248,9 @@ class ExportService:
             )
 
         prices_str = self._format_array_semicolon(listing.price_60_days)
-        calendar_str = self._format_calendar_short(listing.calendar_60_days)
+        calendar_str = self._format_array_semicolon(
+            listing.calendar_60_days
+        )
 
         return [
             listing.external_id,
@@ -269,14 +271,13 @@ class ExportService:
         ]
 
     def _format_array_semicolon(self, values: list[int]) -> str:
-        """Форматирует массив цен в строку через точку с запятой.
+        """Форматирует массив целых чисел в строку через точку с запятой.
 
-        Все 60 значений выводятся в одну строку через «;».
-        Занятые дни имеют значение 0, свободные — реальную цену.
-        Пример: «0;0;0;5500;5500;4800;0;5500;...»
+        Все значения выводятся в одну строку через «;».
+        Используется для столбцов «Цены 60 дней» и «Календарь 60 дней».
 
         Args:
-            values: Массив целых чисел (цены на 60 дней).
+            values: Массив целых чисел.
 
         Returns:
             Строка всех значений через «;» или «—» если пусто.
@@ -284,29 +285,6 @@ class ExportService:
         if not values:
             return "—"
         return ";".join(str(v) for v in values)
-
-    def _format_calendar_short(self, values: list[int]) -> str:
-        """Форматирует массив занятости в компактную строку.
-
-        Показывает первые 14 дней как последовательность 0/1.
-        Например: «00011100001110... (60)»
-
-        Args:
-            values: Массив 0/1 (занятость).
-
-        Returns:
-            Компактная строковая запись календаря.
-        """
-        if not values:
-            return "—"
-
-        preview_count = 14
-        preview = "".join(str(v) for v in values[:preview_count])
-
-        if len(values) > preview_count:
-            preview += f"... ({len(values)})"
-
-        return preview
 
     def _apply_formatting(
         self, ws: Worksheet, data_rows: int
