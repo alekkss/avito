@@ -204,7 +204,7 @@ avito_parser/
 │   │   └── logger.py                # JSON-логирование с trace_id
 │   ├── models/
 │   │   ├── __init__.py              # Реэкспорт моделей
-│   │   └── listing.py               # RawListing (объявление аренды)
+│   │   └── product.py               # RawListing (объявление аренды)
 │   ├── repositories/
 │   │   ├── __init__.py              # Реэкспорт репозиториев
 │   │   ├── base.py                  # Абстрактный репозиторий (ABC)
