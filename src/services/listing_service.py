@@ -12,7 +12,8 @@ import asyncio
 import json
 import random
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlparse, urlunparse
 
 from playwright.async_api import Page
 
@@ -43,6 +44,10 @@ MAX_LISTING_UNBLOCK_RETRIES: int = 5
 
 # Ожидание между попытками разблокировки карточки (секунды)
 LISTING_UNBLOCK_WAIT: int = 15
+
+# Максимальное количество смен прокси для одной карточки
+# (защита от бесконечного цикла ротации)
+MAX_PROXY_ROTATIONS_PER_LISTING: int = 3
 
 # Маппинг текстовых описаний категорий на enum
 ROOM_CATEGORY_MAP: dict[str, RoomCategory] = {
@@ -75,7 +80,6 @@ ROOM_CATEGORY_MAP: dict[str, RoomCategory] = {
 # JavaScript для извлечения координат из карты Avito.
 JS_EXTRACT_COORDINATES: str = """
 () => {
-    // Способ 1: data-атрибуты контейнера карты
     const mapEl = document.querySelector(
         '[data-marker="item-view/item-map"]'
     );
@@ -86,8 +90,6 @@ JS_EXTRACT_COORDINATES: str = """
             return { latitude: parseFloat(lat), longitude: parseFloat(lon) };
         }
     }
-
-    // Способ 2: ищем координаты в JSON-LD разметке
     const scripts = document.querySelectorAll(
         'script[type="application/ld+json"]'
     );
@@ -102,8 +104,6 @@ JS_EXTRACT_COORDINATES: str = """
             }
         } catch (e) {}
     }
-
-    // Способ 3: ищем в __initialData__ или window.dataLayer
     try {
         const pageData = window.__initialData__;
         if (pageData) {
@@ -119,8 +119,6 @@ JS_EXTRACT_COORDINATES: str = """
             }
         }
     } catch (e) {}
-
-    // Способ 4: ищем в атрибутах любого элемента с координатами
     const allElements = document.querySelectorAll('[data-lat][data-lon]');
     if (allElements.length > 0) {
         const el = allElements[0];
@@ -129,7 +127,6 @@ JS_EXTRACT_COORDINATES: str = """
             longitude: parseFloat(el.getAttribute('data-lon'))
         };
     }
-
     return { latitude: 0.0, longitude: 0.0 };
 }
 """
@@ -160,6 +157,43 @@ DATEPICKER_DAY_CONTENT_SELECTOR: str = (
 DATEPICKER_DAY_DISABLED_MARKER: str = "datepicker-day-disabled"
 DATEPICKER_DAY_AVAILABLE_MARKER: str = "datepicker-day-available"
 
+# CSS-селектор кнопки «Сбросить» в датепикере (основной)
+DATEPICKER_RESET_BUTTON_SELECTOR: str = (
+    "button._8761af61d40d8964.f6eebfeb30fe503c._793efba06309a0ff"
+)
+
+
+def _clean_listing_url(url: str) -> str:
+    """Очищает URL карточки от query-параметров бронирования.
+
+    Avito добавляет к ссылкам в каталоге параметры сессии
+    бронирования (checkIn, checkOut, guests, context и др.),
+    которые вызывают ERR_HTTP_RESPONSE_CODE_FAILURE при
+    переходе из другого контекста.
+
+    Args:
+        url: URL карточки (относительный или абсолютный).
+
+    Returns:
+        Чистый URL без query-параметров.
+    """
+    parsed = urlparse(url)
+    clean = urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        "",
+        "",
+        "",
+    ))
+    if clean != url:
+        logger.debug(
+            "listing_url_cleaned",
+            original_length=len(url),
+            clean_url=clean[:200],
+        )
+    return clean
+
 
 class ListingService:
     """Сервис для парсинга карточки объявления краткосрочной аренды.
@@ -167,6 +201,10 @@ class ListingService:
     Переходит на страницу конкретного объявления и извлекает
     все детальные данные, недоступные из каталога: координаты,
     календарь, цены на 60 дней, условия аренды.
+
+    При обнаружении блокировки — ожидает и повторяет. Если
+    стандартные retry исчерпаны и доступны прокси — выполняет
+    ротацию прокси и пробует снова с новым IP.
 
     Attributes:
         _browser_service: Сервис управления браузером.
@@ -193,9 +231,8 @@ class ListingService:
         """Парсит одну карточку объявления аренды.
 
         Переходит на страницу объявления, извлекает все детальные
-        данные и возвращает заполненный объект RawListing.
-        При обнаружении блокировки — ожидает и повторяет
-        до MAX_LISTING_UNBLOCK_RETRIES раз.
+        данные, затем проходит по каждому свободному дню и через
+        датепикер получает реальную цену за сутки.
 
         Args:
             page: Активная страница Playwright.
@@ -210,9 +247,574 @@ class ListingService:
         Returns:
             Заполненный RawListing или None при ошибке парсинга.
         """
-        full_url = url if url.startswith("http") else f"https://www.avito.ru{url}"
+        # Очищаем URL от query-параметров бронирования
+        clean_url = _clean_listing_url(url)
+        full_url = (
+            clean_url if clean_url.startswith("http")
+            else f"https://www.avito.ru{clean_url}"
+        )
 
-        delay = random.uniform(CARD_NAVIGATE_DELAY_MIN, CARD_NAVIGATE_DELAY_MAX)
+        # Используем текущую page из browser_service
+        current_page = self._browser_service.page or page
+
+        # Попытка навигации на карточку с обработкой блокировки
+        navigated = await self._navigate_to_listing(
+            current_page, external_id, full_url
+        )
+
+        if not navigated:
+            current_page = await self._retry_with_proxy_rotation(
+                external_id, full_url
+            )
+            if current_page is None:
+                logger.warning(
+                    "listing_page_permanently_blocked",
+                    external_id=external_id,
+                    max_proxy_rotations=MAX_PROXY_ROTATIONS_PER_LISTING,
+                )
+                return None
+
+        # После возможной ротации берём актуальную page
+        current_page = self._browser_service.page or current_page
+
+        # Извлекаем данные
+        coordinates = await self._extract_coordinates(
+            current_page, external_id
+        )
+        calendar_data = await self._extract_calendar_data(
+            current_page, external_id
+        )
+        room_category = await self._extract_room_category(
+            current_page, title
+        )
+        last_host_update = await self._extract_last_update(current_page)
+
+        host_rating = catalog_host_rating
+        if host_rating == 0.0:
+            host_rating = await self._extract_host_rating(current_page)
+
+        instant_book = is_instant_book
+        if not instant_book:
+            instant_book = await self._extract_instant_book(
+                current_page, external_id
+            )
+
+        calendar_60 = self._pad_array(
+            calendar_data.get("calendar", []), 60, 0
+        )
+        min_stay = calendar_data.get("minStay", 1)
+
+        # === Извлечение реальных цен через датепикер ===
+        prices_60 = await self._extract_prices_for_free_days(
+            current_page,
+            external_id,
+            calendar_60,
+            min_stay,
+            base_price,
+        )
+
+        listing = RawListing(
+            external_id=external_id,
+            latitude=coordinates["latitude"],
+            longitude=coordinates["longitude"],
+            room_category=room_category,
+            price_60_days=prices_60,
+            calendar_60_days=calendar_60,
+            snapshot_timestamp=datetime.now(timezone.utc),
+            last_host_update=last_host_update,
+            min_stay=min_stay,
+            is_instant_book=instant_book,
+            host_rating=host_rating,
+            url=url,
+            title=title,
+        )
+
+        logger.info(
+            "listing_parsed",
+            external_id=external_id,
+            room_category=room_category.value,
+            latitude=coordinates["latitude"],
+            longitude=coordinates["longitude"],
+            occupancy=f"{listing.occupancy_rate:.0%}",
+            avg_price=round(listing.average_price),
+            is_instant_book=instant_book,
+            host_rating=host_rating,
+        )
+
+        return listing
+
+    # ==================================================================
+    # Извлечение реальных цен через датепикер
+    # ==================================================================
+
+    async def _extract_prices_for_free_days(
+        self,
+        page: Page,
+        external_id: str,
+        calendar_60: list[int],
+        min_stay: int,
+        base_price: int,
+    ) -> list[int]:
+        """Извлекает реальные цены для каждого свободного дня.
+
+        Для каждого свободного дня (calendar_60[i] == 0):
+        1. Открывает датепикер заново (чистое состояние).
+        2. Нажимает кнопку «Сбросить» для гарантированного
+           сброса ранее выбранных дат.
+        3. Листает до месяца даты заезда.
+        4. Кликает на дату заезда (check-in).
+        5. Читает мин. срок из текста датепикера.
+        6. Вычисляет дату выезда = заезд + мин. срок.
+        7. Листает до месяца выезда, кликает дату выезда.
+        8. Читает цену из элемента цены на странице.
+        9. Полностью сбрасывает и закрывает датепикер.
+
+        Занятые дни получают цену 0.
+
+        Args:
+            page: Активная страница Playwright.
+            external_id: ID объявления для логирования.
+            calendar_60: Массив занятости (0 — свободен, 1 — занят).
+            min_stay: Фоллбэк мин. срока аренды.
+            base_price: Цена-фоллбэк при ошибке чтения.
+
+        Returns:
+            Массив цен на 60 дней.
+        """
+        today = date.today()
+        prices: list[int] = [0] * CALENDAR_DAYS_TARGET
+
+        free_days = [
+            i for i in range(len(calendar_60))
+            if calendar_60[i] == 0
+        ]
+
+        if not free_days:
+            logger.info(
+                "prices_no_free_days",
+                external_id=external_id,
+            )
+            return prices
+
+        logger.info(
+            "prices_extraction_started",
+            external_id=external_id,
+            free_days=len(free_days),
+            total_days=len(calendar_60),
+        )
+
+        for day_idx in free_days:
+            checkin = today + timedelta(days=day_idx)
+
+            # --- Шаг 1: Полный сброс — закрываем датепикер если открыт ---
+            # Это гарантирует чистое состояние перед каждой датой
+            existing_dp = await page.query_selector(
+                DATEPICKER_CONTAINER_SELECTOR
+            )
+            if existing_dp:
+                await self._close_datepicker(page)
+                await asyncio.sleep(0.3)
+
+            # --- Шаг 2: Открываем датепикер заново ---
+            opened = await self._open_datepicker(page, external_id)
+            if not opened:
+                logger.debug(
+                    "prices_datepicker_not_opened",
+                    external_id=external_id,
+                    day_idx=day_idx,
+                )
+                prices[day_idx] = base_price
+                continue
+
+            await asyncio.sleep(0.3)
+
+            # --- Шаг 2.5: Сбрасываем датепикер кнопкой «Сбросить» ---
+            # Гарантирует, что предыдущий выбор дат полностью очищен
+            await self._reset_datepicker(page, external_id)
+            await asyncio.sleep(0.3)
+
+            # --- Шаг 3: Листаем до месяца заезда ---
+            month_found = await self._navigate_datepicker_to_month(
+                page, checkin.year, checkin.month
+            )
+            if not month_found:
+                logger.debug(
+                    "prices_month_not_found",
+                    external_id=external_id,
+                    month=f"{checkin.year}-{checkin.month:02d}",
+                )
+                await self._close_datepicker(page)
+                prices[day_idx] = base_price
+                continue
+
+            # --- Шаг 4: Кликаем на дату заезда ---
+            clicked_in = await self._click_datepicker_day(
+                page, checkin.year, checkin.month, checkin.day
+            )
+            if not clicked_in:
+                logger.debug(
+                    "prices_checkin_click_failed",
+                    external_id=external_id,
+                    checkin=str(checkin),
+                )
+                await self._close_datepicker(page)
+                prices[day_idx] = base_price
+                continue
+
+            await asyncio.sleep(0.5)
+
+            # --- Шаг 5: Читаем мин. срок из текста датепикера ---
+            actual_min_stay = await self._read_min_stay_from_datepicker(
+                page, min_stay
+            )
+            checkout = checkin + timedelta(days=actual_min_stay)
+
+            # --- Шаг 6: Листаем до месяца выезда и кликаем ---
+            checkout_month_found = (
+                await self._navigate_datepicker_to_month(
+                    page, checkout.year, checkout.month
+                )
+            )
+            if checkout_month_found:
+                clicked_out = await self._click_datepicker_day(
+                    page, checkout.year, checkout.month, checkout.day
+                )
+                if not clicked_out:
+                    logger.debug(
+                        "prices_checkout_click_failed",
+                        external_id=external_id,
+                        checkout=str(checkout),
+                    )
+                await asyncio.sleep(0.5)
+
+            # --- Шаг 7: Читаем цену ---
+            price = await self._read_item_price(page)
+            if price is not None and price > 0:
+                prices[day_idx] = price
+            else:
+                prices[day_idx] = base_price
+
+            logger.debug(
+                "prices_day_extracted",
+                external_id=external_id,
+                day_idx=day_idx,
+                checkin=str(checkin),
+                checkout=str(checkout),
+                min_stay_used=actual_min_stay,
+                price=prices[day_idx],
+            )
+
+            # --- Шаг 8: Полный сброс датепикера ---
+            await self._close_datepicker(page)
+            await asyncio.sleep(0.3)
+
+        filled = sum(1 for i in free_days if prices[i] > 0)
+        logger.info(
+            "prices_extraction_completed",
+            external_id=external_id,
+            free_days=len(free_days),
+            prices_filled=filled,
+        )
+
+        return prices
+
+    async def _reset_datepicker(
+        self, page: Page, external_id: str
+    ) -> bool:
+        """Нажимает кнопку «Сбросить» в открытом датепикере.
+
+        Гарантирует сброс ранее выбранных дат заезда/выезда
+        перед новым циклом выбора. Сначала ищет кнопку по
+        CSS-селектору из HTML-разметки Avito, затем — фоллбэк
+        по тексту «Сбросить» среди всех кнопок датепикера.
+
+        Args:
+            page: Активная страница Playwright.
+            external_id: ID объявления для логирования.
+
+        Returns:
+            True если кнопка найдена и нажата.
+        """
+        # Способ 1: поиск по CSS-селектору кнопки «Сбросить»
+        try:
+            reset_btn = await page.query_selector(
+                DATEPICKER_RESET_BUTTON_SELECTOR
+            )
+            if reset_btn:
+                await reset_btn.click()
+                logger.debug(
+                    "datepicker_reset_by_css",
+                    external_id=external_id,
+                )
+                return True
+        except Exception as e:
+            logger.debug(
+                "datepicker_reset_css_failed",
+                external_id=external_id,
+                error=str(e),
+            )
+
+        # Способ 2: поиск кнопки по тексту «Сбросить» внутри датепикера
+        try:
+            buttons = await page.query_selector_all(
+                "[data-marker='datepicker'] button"
+            )
+            for button in buttons:
+                try:
+                    button_text = (await button.inner_text()).strip()
+                    if "сбросить" in button_text.lower():
+                        await button.click()
+                        logger.debug(
+                            "datepicker_reset_by_text",
+                            external_id=external_id,
+                        )
+                        return True
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug(
+                "datepicker_reset_text_search_failed",
+                external_id=external_id,
+                error=str(e),
+            )
+
+        # Способ 3: поиск через JavaScript по содержимому span
+        try:
+            reset_found: bool = await page.evaluate("""
+                () => {
+                    const dp = document.querySelector(
+                        '[data-marker="datepicker"]'
+                    );
+                    if (!dp) return false;
+                    const buttons = dp.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        const spans = btn.querySelectorAll('span');
+                        for (const span of spans) {
+                            if (span.textContent.trim() === 'Сбросить') {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if reset_found:
+                logger.debug(
+                    "datepicker_reset_by_js",
+                    external_id=external_id,
+                )
+                return True
+        except Exception as e:
+            logger.debug(
+                "datepicker_reset_js_failed",
+                external_id=external_id,
+                error=str(e),
+            )
+
+        logger.debug(
+            "datepicker_reset_button_not_found",
+            external_id=external_id,
+        )
+        return False
+
+    async def _navigate_datepicker_to_month(
+        self,
+        page: Page,
+        target_year: int,
+        target_month: int,
+    ) -> bool:
+        """Листает датепикер вперёд до нужного месяца.
+
+        Datepicker Avito использует 0-indexed месяц в атрибуте
+        data-marker (JS Date формат): апрель → 3, январь → 0.
+
+        Args:
+            target_year: Год (4 цифры).
+            target_month: Месяц (1-12, обычный формат).
+
+        Returns:
+            True если нужный месяц стал видимым.
+        """
+        target_month_0 = target_month - 1
+
+        for _ in range(MAX_MONTH_SWITCHES):
+            is_visible: bool = await page.evaluate(
+                f"() => !!document.querySelector("
+                f"'[data-marker=\"datepicker/calendar"
+                f"({target_year}-{target_month_0})\"]')"
+            )
+            if is_visible:
+                return True
+
+            next_btn = await page.query_selector(
+                DATEPICKER_NEXT_BUTTON_SELECTOR
+            )
+            if not next_btn:
+                return False
+
+            disabled = await next_btn.get_attribute("disabled")
+            if disabled is not None:
+                return False
+
+            await next_btn.click()
+            await asyncio.sleep(0.4)
+
+        return False
+
+    async def _click_datepicker_day(
+        self,
+        page: Page,
+        target_year: int,
+        target_month: int,
+        target_day: int,
+    ) -> bool:
+        """Кликает на доступный день в видимом месяце датепикера.
+
+        Args:
+            target_year: Год.
+            target_month: Месяц (1-12).
+            target_day: День месяца.
+
+        Returns:
+            True если клик выполнен успешно.
+        """
+        target_month_0 = target_month - 1
+
+        el_handle = await page.evaluate_handle(
+            f"""() => {{
+                const cal = document.querySelector(
+                    '[data-marker="datepicker/calendar'
+                    + '({target_year}-{target_month_0})"]'
+                );
+                if (!cal) return null;
+                const dayContents = cal.querySelectorAll(
+                    '[data-marker="datepicker/content"]'
+                );
+                for (const dayEl of dayContents) {{
+                    const inner = dayEl.querySelector(
+                        '[data-marker="datepicker-day-available"]'
+                    );
+                    if (!inner) continue;
+                    if (parseInt(inner.textContent.trim()) === {target_day}) {{
+                        return inner;
+                    }}
+                }}
+                return null;
+            }}"""
+        )
+
+        try:
+            el = el_handle.as_element()
+            if el:
+                await el.click()
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    async def _read_item_price(self, page: Page) -> int | None:
+        """Читает текущую цену из элемента цены на странице.
+
+        Avito обновляет цену динамически после выбора дат
+        заезда и выезда в датепикере.
+
+        Args:
+            page: Активная страница Playwright.
+
+        Returns:
+            Цена в рублях или None если не найдена.
+        """
+        try:
+            price_el = await page.query_selector(
+                "[data-marker='item-view/item-price']"
+            )
+            if price_el:
+                content = await price_el.get_attribute("content")
+                if content:
+                    price = int(content.strip())
+                    if price > 0:
+                        return price
+        except (ValueError, TypeError, Exception):
+            pass
+        return None
+
+    async def _read_min_stay_from_datepicker(
+        self,
+        page: Page,
+        default_min_stay: int,
+    ) -> int:
+        """Читает мин. срок аренды из текста датепикера.
+
+        После клика на дату заезда Avito отображает в датепикере
+        текст вида «Бронь минимум от N суток».
+
+        Args:
+            page: Активная страница Playwright.
+            default_min_stay: Фоллбэк-значение.
+
+        Returns:
+            Минимальный срок аренды в сутках.
+        """
+        try:
+            datepicker_el = await page.query_selector(
+                DATEPICKER_CONTAINER_SELECTOR
+            )
+            if not datepicker_el:
+                return default_min_stay
+
+            dp_text = (await datepicker_el.inner_text()).strip()
+
+            patterns = [
+                r"(?:бронь|бронирование)\s+минимум\s+от\s+(\d+)\s*"
+                r"(?:суток|сут\.|ноч[еёий]*|дн[яей]*)",
+                r"(?:минимум|мин\.?)\s*(?:от\s*)?(\d+)\s*"
+                r"(?:суток|сут\.|ноч[еёий]*|дн[яей]*)",
+                r"(?:от|мин[.\s]*срок[а]?)\s*(\d+)\s*"
+                r"(?:суток|сут\.|ноч[еёий]*|дн[яей]*)",
+                r"(\d+)\s*(?:суток|сут\.)\s*(?:минимум|мин\.?)",
+            ]
+
+            for pattern in patterns:
+                match = re.search(pattern, dp_text, re.IGNORECASE)
+                if match:
+                    value = int(match.group(1))
+                    if 1 <= value <= 365:
+                        return value
+
+        except Exception:
+            pass
+
+        return default_min_stay
+
+    # ==================================================================
+    # Навигация и обработка блокировок
+    # ==================================================================
+
+    async def _navigate_to_listing(
+        self,
+        page: Page,
+        external_id: str,
+        full_url: str,
+    ) -> bool:
+        """Переходит на карточку объявления и проверяет блокировку.
+
+        Выполняет навигацию с задержкой, проверяет блокировку
+        и при необходимости ожидает разблокировки стандартным
+        retry-механизмом (5 попыток).
+
+        Args:
+            page: Активная страница Playwright.
+            external_id: ID объявления для логирования.
+            full_url: Полный URL карточки.
+
+        Returns:
+            True если страница загружена без блокировки.
+        """
+        delay = random.uniform(
+            CARD_NAVIGATE_DELAY_MIN, CARD_NAVIGATE_DELAY_MAX
+        )
         logger.debug(
             "listing_navigation_delay",
             external_id=external_id,
@@ -234,7 +836,7 @@ class ListingService:
                 url=full_url[:200],
                 error=str(e),
             )
-            return None
+            return False
 
         # Проверяем блокировку с retry-логикой
         is_blocked = await self._browser_service._check_blocked()
@@ -243,73 +845,94 @@ class ListingService:
                 page, external_id, full_url
             )
             if not unblocked:
-                logger.warning(
-                    "listing_page_permanently_blocked",
+                return False
+
+        return True
+
+    async def _retry_with_proxy_rotation(
+        self,
+        external_id: str,
+        full_url: str,
+    ) -> Page | None:
+        """Пробует сменить прокси и повторно зайти на карточку.
+
+        Выполняет до MAX_PROXY_ROTATIONS_PER_LISTING ротаций прокси.
+        После каждой ротации — навигация на карточку + стандартный
+        retry при блокировке. Если все ротации исчерпаны — возвращает None.
+
+        Args:
+            external_id: ID объявления для логирования.
+            full_url: Полный URL карточки.
+
+        Returns:
+            Новая Page, на которой карточка загружена, или None.
+        """
+        if not self._browser_service.has_proxies:
+            logger.warning(
+                "proxy_rotation_unavailable",
+                external_id=external_id,
+                reason="прокси не загружены",
+            )
+            return None
+
+        for rotation in range(1, MAX_PROXY_ROTATIONS_PER_LISTING + 1):
+            logger.info(
+                "proxy_rotation_for_listing",
+                external_id=external_id,
+                rotation=rotation,
+                max_rotations=MAX_PROXY_ROTATIONS_PER_LISTING,
+            )
+            print(
+                f"  [прокси] Смена прокси для карточки "
+                f"{external_id} (попытка {rotation}/"
+                f"{MAX_PROXY_ROTATIONS_PER_LISTING})"
+            )
+
+            try:
+                new_page = await self._browser_service.rotate_proxy()
+            except RuntimeError as e:
+                logger.error(
+                    "proxy_rotation_failed",
                     external_id=external_id,
-                    max_attempts=MAX_LISTING_UNBLOCK_RETRIES,
+                    rotation=rotation,
+                    error=str(e),
                 )
                 return None
 
-        # Извлекаем данные
-        coordinates = await self._extract_coordinates(page, external_id)
-        calendar_data = await self._extract_calendar_data(page, external_id)
-        room_category = await self._extract_room_category(page, title)
-        last_host_update = await self._extract_last_update(page)
-
-        # Рейтинг хоста: приоритет — данные из каталога,
-        # фоллбэк — поиск на странице карточки
-        host_rating = catalog_host_rating
-        if host_rating == 0.0:
-            host_rating = await self._extract_host_rating(page)
-
-        # Мгновенное бронирование: приоритет — бейдж из каталога,
-        # фоллбэк — поиск на странице карточки
-        instant_book = is_instant_book
-        if not instant_book:
-            instant_book = await self._extract_instant_book(
-                page, external_id
+            navigated = await self._navigate_to_listing(
+                new_page, external_id, full_url
             )
 
-        # Формируем массив цен на 60 дней
-        prices_60 = calendar_data.get("prices", [])
-        if not prices_60:
-            prices_60 = [base_price] * 60
+            if navigated:
+                logger.info(
+                    "listing_loaded_after_proxy_rotation",
+                    external_id=external_id,
+                    rotation=rotation,
+                )
+                print(
+                    f"  [прокси] Карточка {external_id} загружена "
+                    f"после смены прокси (попытка {rotation})"
+                )
+                return new_page
 
-        # Дополняем до 60 элементов при необходимости
-        prices_60 = self._pad_array(prices_60, 60, base_price)
-        calendar_60 = self._pad_array(
-            calendar_data.get("calendar", []), 60, 0
-        )
+            logger.warning(
+                "listing_still_blocked_after_rotation",
+                external_id=external_id,
+                rotation=rotation,
+            )
+            print(
+                f"  [прокси] Карточка {external_id} всё ещё "
+                f"заблокирована после смены прокси "
+                f"(попытка {rotation}/"
+                f"{MAX_PROXY_ROTATIONS_PER_LISTING})"
+            )
 
-        listing = RawListing(
+        logger.error(
+            "all_proxy_rotations_exhausted_for_listing",
             external_id=external_id,
-            latitude=coordinates["latitude"],
-            longitude=coordinates["longitude"],
-            room_category=room_category,
-            price_60_days=prices_60,
-            calendar_60_days=calendar_60,
-            snapshot_timestamp=datetime.now(timezone.utc),
-            last_host_update=last_host_update,
-            min_stay=calendar_data.get("minStay", 1),
-            is_instant_book=instant_book,
-            host_rating=host_rating,
-            url=url,
-            title=title,
+            max_rotations=MAX_PROXY_ROTATIONS_PER_LISTING,
         )
-
-        logger.info(
-            "listing_parsed",
-            external_id=external_id,
-            room_category=room_category.value,
-            latitude=coordinates["latitude"],
-            longitude=coordinates["longitude"],
-            occupancy=f"{listing.occupancy_rate:.0%}",
-            avg_price=round(listing.average_price),
-            is_instant_book=instant_book,
-            host_rating=host_rating,
-        )
-
-        return listing
+        return None
 
     async def _wait_for_listing_unblock(
         self,
@@ -347,7 +970,6 @@ class ListingService:
 
             await asyncio.sleep(LISTING_UNBLOCK_WAIT)
 
-            # Обновляем страницу
             try:
                 await page.goto(
                     full_url,
@@ -377,7 +999,6 @@ class ListingService:
                 )
                 continue
 
-            # Проверяем, снята ли блокировка
             is_blocked = await self._browser_service._check_blocked()
             if not is_blocked:
                 logger.info(
@@ -405,7 +1026,9 @@ class ListingService:
             "listing_block_not_resolved",
             external_id=external_id,
             max_attempts=MAX_LISTING_UNBLOCK_RETRIES,
-            total_wait_seconds=MAX_LISTING_UNBLOCK_RETRIES * LISTING_UNBLOCK_WAIT,
+            total_wait_seconds=(
+                MAX_LISTING_UNBLOCK_RETRIES * LISTING_UNBLOCK_WAIT
+            ),
         )
         print(
             f"  [блокировка] Не удалось разблокировать за "
@@ -422,10 +1045,6 @@ class ListingService:
         self, page: Page, external_id: str
     ) -> dict[str, float]:
         """Извлекает координаты объекта со страницы.
-
-        Использует JavaScript-инъекцию для поиска координат
-        в различных источниках: data-атрибуты карты, JSON-LD,
-        глобальные переменные.
 
         Args:
             page: Активная страница Playwright.
@@ -451,7 +1070,6 @@ class ListingService:
                 error=str(e),
             )
 
-        # Фоллбэк: ищем координаты в тексте страницы
         try:
             content = await page.content()
             coords = self._find_coordinates_in_html(content)
@@ -513,15 +1131,6 @@ class ListingService:
     ) -> dict:
         """Извлекает календарь занятости из datepicker на странице.
 
-        Открывает datepicker кликом на поле даты, затем парсит
-        видимые месяцы. Определяет занятость каждого дня по
-        наличию атрибута data-disabled="true" на элементах
-        с data-marker="datepicker/content". Листает месяцы
-        вперёд кнопкой next для сбора 60 дней.
-
-        Важно: дни раньше сегодняшней даты отфильтровываются,
-        чтобы массив calendar начинался строго с текущего дня.
-
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
@@ -535,7 +1144,6 @@ class ListingService:
             "minStay": 1,
         }
 
-        # --- Шаг 1: Открываем datepicker ---
         datepicker_opened = await self._open_datepicker(
             page, external_id
         )
@@ -546,7 +1154,6 @@ class ListingService:
             )
             return result
 
-        # --- Шаг 2: Парсим видимые месяцы и листаем вперёд ---
         today = date.today()
         all_days: list[dict] = []
         months_switched = 0
@@ -576,27 +1183,15 @@ class ListingService:
             )
 
             if months_switched >= MAX_MONTH_SWITCHES:
-                logger.debug(
-                    "datepicker_max_month_switches_reached",
-                    external_id=external_id,
-                    max_switches=MAX_MONTH_SWITCHES,
-                    total_days=len(all_days),
-                )
                 break
 
             switched = await self._click_next_month(page, external_id)
             if not switched:
-                logger.debug(
-                    "datepicker_cannot_switch_month",
-                    external_id=external_id,
-                    months_switched=months_switched,
-                )
                 break
 
             months_switched += 1
             await asyncio.sleep(random.uniform(0.5, 1.0))
 
-        # --- Шаг 2.1: Фильтрация — только дни начиная с сегодня ---
         filtered_bits: list[int] = []
         for day_info in all_days:
             try:
@@ -630,23 +1225,22 @@ class ListingService:
             first_date=str(today),
         )
 
-        # --- Шаг 3: Извлекаем мин. срок ---
         result["minStay"] = await self._extract_min_stay(
             page, external_id
         )
 
-        # Закрываем datepicker
         await self._close_datepicker(page)
 
         return result
+
+    # ==================================================================
+    # Datepicker: открытие, парсинг дней, листание, закрытие
+    # ==================================================================
 
     async def _open_datepicker(
         self, page: Page, external_id: str
     ) -> bool:
         """Открывает datepicker кликом на поле ввода даты.
-
-        Пробует несколько CSS-селекторов для поиска поля даты,
-        затем кликает и ожидает появления контейнера datepicker.
 
         Args:
             page: Активная страница Playwright.
@@ -725,10 +1319,6 @@ class ListingService:
                         DATEPICKER_CONTAINER_SELECTOR,
                         timeout=DATEPICKER_OPEN_TIMEOUT,
                     )
-                    logger.debug(
-                        "datepicker_opened_via_fallback",
-                        external_id=external_id,
-                    )
                     return True
                 except Exception:
                     pass
@@ -746,17 +1336,12 @@ class ListingService:
     ) -> list[dict]:
         """Парсит все видимые дни из открытого datepicker.
 
-        Возвращает сырые данные с годом, месяцем, днём и
-        флагом disabled для каждого дня. Фильтрация по дате
-        выполняется вызывающим кодом.
-
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
 
         Returns:
             Список словарей с ключами year, month, day, disabled.
-            Месяц — 1-indexed (1=январь, 12=декабрь).
         """
         js_parse_days = """
         () => {
@@ -764,12 +1349,10 @@ class ListingService:
                 '[data-marker="datepicker"]'
             );
             if (!datepicker) return [];
-
             const calendars = datepicker.querySelectorAll(
                 '[data-marker^="datepicker/calendar("]'
             );
             const results = [];
-
             for (const calendar of calendars) {
                 const marker = calendar.getAttribute('data-marker') || '';
                 const monthMatch = marker.match(
@@ -779,26 +1362,20 @@ class ListingService:
                 const calMonth = monthMatch
                     ? parseInt(monthMatch[2]) + 1
                     : 0;
-
                 const dayElements = calendar.querySelectorAll(
                     '[data-marker="datepicker/content"]'
                 );
-
                 for (const dayEl of dayElements) {
                     const innerDiv = dayEl.querySelector(
                         '[data-marker="datepicker-day-disabled"],'
                         + '[data-marker="datepicker-day-available"]'
                     );
-
                     if (!innerDiv) continue;
-
                     const dayText = innerDiv.textContent.trim();
                     const dayNum = parseInt(dayText);
                     if (isNaN(dayNum)) continue;
-
                     const isDisabled =
                         dayEl.getAttribute('data-disabled') === 'true';
-
                     results.push({
                         year: calYear,
                         month: calMonth,
@@ -807,7 +1384,6 @@ class ListingService:
                     });
                 }
             }
-
             return results;
         }
         """
@@ -837,18 +1413,6 @@ class ListingService:
             "datepicker_visible_days_parsed_raw",
             external_id=external_id,
             total_days=len(sorted_days),
-            first_day=(
-                f"{sorted_days[0]['year']}-"
-                f"{sorted_days[0]['month']:02d}-"
-                f"{sorted_days[0]['day']:02d}"
-                if sorted_days else "none"
-            ),
-            last_day=(
-                f"{sorted_days[-1]['year']}-"
-                f"{sorted_days[-1]['month']:02d}-"
-                f"{sorted_days[-1]['day']:02d}"
-                if sorted_days else "none"
-            ),
         )
 
         return sorted_days
@@ -856,41 +1420,28 @@ class ListingService:
     async def _click_next_month(
         self, page: Page, external_id: str
     ) -> bool:
-        """Нажимает кнопку переключения на следующий месяц в datepicker.
+        """Нажимает кнопку переключения на следующий месяц.
 
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
 
         Returns:
-            True если кнопка найдена и нажата успешно.
+            True если кнопка найдена и нажата.
         """
         try:
             next_button = await page.query_selector(
                 DATEPICKER_NEXT_BUTTON_SELECTOR
             )
             if not next_button:
-                logger.debug(
-                    "datepicker_next_button_not_found",
-                    external_id=external_id,
-                )
                 return False
 
             is_disabled = await next_button.get_attribute("disabled")
             if is_disabled is not None:
-                logger.debug(
-                    "datepicker_next_button_disabled",
-                    external_id=external_id,
-                )
                 return False
 
             await next_button.click()
             await asyncio.sleep(random.uniform(0.5, 1.0))
-
-            logger.debug(
-                "datepicker_next_month_clicked",
-                external_id=external_id,
-            )
             return True
 
         except Exception as e:
@@ -904,17 +1455,7 @@ class ListingService:
     async def _extract_min_stay(
         self, page: Page, external_id: str
     ) -> int:
-        """Извлекает минимальный срок аренды из datepicker.
-
-        Для отображения текста «Бронь минимум от N ночей»
-        нужно кликнуть на свободную дату в datepicker.
-        После извлечения данных закрывает и переоткрывает
-        datepicker для возврата в исходное состояние.
-
-        Приоритет источников:
-        1. Текст внутри datepicker после клика на свободную дату.
-        2. Текст на странице карточки объявления.
-        3. Данные из window.__initialData__.
+        """Извлекает минимальный срок аренды.
 
         Args:
             page: Активная страница Playwright.
@@ -951,11 +1492,6 @@ class ListingService:
                 if match:
                     min_stay_val = int(match.group(1))
                     if 1 <= min_stay_val <= 365:
-                        logger.debug(
-                            "min_stay_extracted_from_page_text",
-                            external_id=external_id,
-                            min_stay=min_stay_val,
-                        )
                         return min_stay_val
 
             js_min_stay = """
@@ -973,11 +1509,6 @@ class ListingService:
             """
             result = await page.evaluate(js_min_stay)
             if result and result > 0:
-                logger.debug(
-                    "min_stay_extracted_from_initial_data",
-                    external_id=external_id,
-                    min_stay=result,
-                )
                 return result
 
         except Exception as e:
@@ -994,18 +1525,12 @@ class ListingService:
     ) -> int | None:
         """Кликает на свободные даты и читает мин. срок.
 
-        После каждого клика на дату Avito активирует режим выбора
-        диапазона (заезд → выезд), из-за чего DOM datepicker
-        перестраивается. Поэтому после каждой попытки datepicker
-        закрывается и открывается заново, а свободные даты
-        находятся повторно из свежего DOM.
-
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
 
         Returns:
-            Минимальный срок в сутках или None если не удалось.
+            Минимальный срок в сутках или None.
         """
         max_attempts = 5
         day_indices_to_try = [0, 1, 3, 5, 8]
@@ -1013,21 +1538,12 @@ class ListingService:
         for attempt_num, day_index in enumerate(
             day_indices_to_try[:max_attempts], start=1
         ):
-            print(
-                f"\n  [datepicker] Попытка {attempt_num}/{max_attempts}: "
-                f"ищу свободную дату с индексом {day_index}"
-            )
-
             datepicker_visible = await page.query_selector(
                 DATEPICKER_CONTAINER_SELECTOR
             )
             if not datepicker_visible:
                 reopened = await self._open_datepicker(page, external_id)
                 if not reopened:
-                    print(
-                        f"  [datepicker] Не удалось открыть datepicker "
-                        f"на попытке {attempt_num}"
-                    )
                     return None
                 await asyncio.sleep(0.5)
 
@@ -1037,37 +1553,15 @@ class ListingService:
             )
 
             if not free_day_elements:
-                print(
-                    f"  [datepicker] Свободные даты не найдены "
-                    f"на попытке {attempt_num}"
-                )
                 return None
 
             total_free = len(free_day_elements)
-            print(
-                f"  [datepicker] Свободных дат в DOM: {total_free}"
-            )
-
             actual_index = min(day_index, total_free - 1)
             day_el = free_day_elements[actual_index]
 
             try:
-                day_text = (await day_el.inner_text()).strip()
-            except Exception:
-                day_text = f"#{actual_index}"
-
-            print(
-                f"  [datepicker] Кликаю на день {day_text} "
-                f"(индекс {actual_index})"
-            )
-
-            try:
                 await day_el.click()
-            except Exception as e:
-                print(
-                    f"  [datepicker] Не удалось кликнуть "
-                    f"на день {day_text}: {e}"
-                )
+            except Exception:
                 await self._close_datepicker(page)
                 await asyncio.sleep(0.5)
                 continue
@@ -1078,30 +1572,10 @@ class ListingService:
                 DATEPICKER_CONTAINER_SELECTOR
             )
             if not datepicker_el:
-                print(
-                    f"  [datepicker] Контейнер datepicker исчез "
-                    f"после клика на день {day_text}"
-                )
                 await asyncio.sleep(0.5)
                 continue
 
             dp_text = (await datepicker_el.inner_text()).strip()
-
-            print(
-                f"  [datepicker] Текст datepicker после клика "
-                f"на день {day_text}:\n"
-                f"  ---\n"
-                f"  {dp_text}\n"
-                f"  ---"
-            )
-
-            logger.debug(
-                "min_stay_datepicker_text_after_click",
-                external_id=external_id,
-                day=day_text,
-                attempt=attempt_num,
-                text=dp_text[:200],
-            )
 
             dp_match = re.search(
                 r"(?:бронь|минимум|мин\.?)\s*(?:от\s*)?(\d+)\s*"
@@ -1112,36 +1586,22 @@ class ListingService:
             if dp_match:
                 min_stay_val = int(dp_match.group(1))
                 if 1 <= min_stay_val <= 365:
-                    print(
-                        f"  [datepicker] Найден мин. срок: "
-                        f"{min_stay_val} сут. (день {day_text})"
-                    )
                     logger.debug(
                         "min_stay_extracted_from_datepicker",
                         external_id=external_id,
                         min_stay=min_stay_val,
-                        day=day_text,
                         attempt=attempt_num,
                     )
                     await self._close_datepicker(page)
                     return min_stay_val
-            else:
-                print(
-                    f"  [datepicker] Паттерн мин. срока "
-                    f"НЕ найден (день {day_text})"
-                )
 
             await self._close_datepicker(page)
             await asyncio.sleep(0.5)
 
-        print(
-            f"  [datepicker] Мин. срок не найден ни в одной "
-            f"из {max_attempts} попыток"
-        )
         return None
 
     async def _close_datepicker(self, page: Page) -> None:
-        """Закрывает datepicker кликом вне его области.
+        """Закрывает datepicker.
 
         Args:
             page: Активная страница Playwright.
@@ -1156,9 +1616,6 @@ class ListingService:
                     if "сбросить" in button_text.lower():
                         await button.click()
                         await asyncio.sleep(0.5)
-                        print(
-                            f"  [datepicker] Нажата кнопка «Сбросить»"
-                        )
                         break
                 except Exception:
                     continue
@@ -1177,14 +1634,14 @@ class ListingService:
         except Exception:
             pass
 
+    # ==================================================================
+    # Извлечение мгновенного бронирования
+    # ==================================================================
+
     async def _extract_instant_book(
         self, page: Page, external_id: str
     ) -> bool:
-        """Извлекает флаг мгновенного бронирования со страницы карточки.
-
-        Используется как фоллбэк, если бейдж не был найден
-        в каталоге. Ищет признаки мгновенного бронирования
-        в DOM и в тексте страницы.
+        """Извлекает флаг мгновенного бронирования.
 
         Args:
             page: Активная страница Playwright.
@@ -1249,7 +1706,7 @@ class ListingService:
     async def _extract_room_category(
         self, page: Page, title: str
     ) -> RoomCategory:
-        """Определяет категорию жилья по странице и названию.
+        """Определяет категорию жилья.
 
         Args:
             page: Активная страница Playwright.
@@ -1312,7 +1769,7 @@ class ListingService:
     # ==================================================================
 
     async def _extract_host_rating(self, page: Page) -> float:
-        """Извлекает рейтинг хоста со страницы объявления.
+        """Извлекает рейтинг хоста со страницы.
 
         Args:
             page: Активная страница Playwright.
@@ -1349,7 +1806,7 @@ class ListingService:
     async def _extract_last_update(
         self, page: Page
     ) -> datetime | None:
-        """Извлекает время последнего обновления объявления хостом.
+        """Извлекает время последнего обновления объявления.
 
         Args:
             page: Активная страница Playwright.
@@ -1403,7 +1860,6 @@ class ListingService:
 
         match = re.search(r"вчера.*?(\d{1,2}):(\d{2})", text)
         if match:
-            from datetime import timedelta
             hour, minute = int(match.group(1)), int(match.group(2))
             yesterday = now - timedelta(days=1)
             return yesterday.replace(
@@ -1425,7 +1881,9 @@ class ListingService:
 
                     time_match = re.search(r"(\d{1,2}):(\d{2})", text)
                     hour = int(time_match.group(1)) if time_match else 0
-                    minute = int(time_match.group(2)) if time_match else 0
+                    minute = (
+                        int(time_match.group(2)) if time_match else 0
+                    )
 
                     try:
                         return datetime(

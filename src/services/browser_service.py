@@ -1,16 +1,23 @@
 """Сервис управления Playwright-браузером.
 
 Инкапсулирует запуск браузера, создание контекста со stealth-настройками,
-имитацию человеческого поведения и управление жизненным циклом.
-Основан на шаблоне с антидетект-параметрами для обхода защиты Avito.
+имитацию человеческого поведения, ротацию прокси и управление жизненным
+циклом. Основан на шаблоне с антидетект-параметрами для обхода защиты Avito.
 """
 
 import asyncio
 import random
+from dataclasses import dataclass
+from pathlib import Path
 
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    async_playwright,
+)
 
-from src.config import BrowserSettings, get_logger
+from src.config import BrowserSettings, ProxySettings, get_logger
 
 logger = get_logger("browser_service")
 
@@ -28,6 +35,21 @@ USER_AGENTS: list[str] = [
     ),
     (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
@@ -93,38 +115,287 @@ MAX_CLOUDFLARE_RETRIES: int = 3
 CLOUDFLARE_WAIT_SECONDS: int = 15
 
 
+@dataclass
+class ProxyInfo:
+    """Данные одного прокси-сервера.
+
+    Attributes:
+        server: URL прокси в формате http://host:port.
+        username: Имя пользователя для авторизации.
+        password: Пароль для авторизации.
+    """
+
+    server: str
+    username: str
+    password: str
+
+
+def _load_proxies_from_file(file_path: str) -> list[ProxyInfo]:
+    """Загружает список прокси из текстового файла.
+
+    Формат каждой строки: host:port:username:password.
+    Пустые строки и строки, начинающиеся с #, пропускаются.
+
+    Args:
+        file_path: Путь к файлу с прокси.
+
+    Returns:
+        Список объектов ProxyInfo.
+
+    Raises:
+        RuntimeError: Если файл не содержит валидных прокси.
+    """
+    proxies: list[ProxyInfo] = []
+    path = Path(file_path)
+
+    if not path.exists():
+        raise RuntimeError(
+            f"Файл прокси не найден: {file_path}"
+        )
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            line = line.strip()
+
+            # Пропускаем пустые строки и комментарии
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split(":")
+            if len(parts) != 4:
+                logger.warning(
+                    "proxy_line_invalid_format",
+                    line_num=line_num,
+                    expected="host:port:user:pass",
+                )
+                continue
+
+            host, port, username, password = parts
+
+            try:
+                int(port)
+            except ValueError:
+                logger.warning(
+                    "proxy_line_invalid_port",
+                    line_num=line_num,
+                    port=port,
+                )
+                continue
+
+            proxies.append(ProxyInfo(
+                server=f"http://{host}:{port}",
+                username=username,
+                password=password,
+            ))
+
+    if not proxies:
+        raise RuntimeError(
+            f"Файл прокси '{file_path}' не содержит валидных записей. "
+            f"Формат строки: host:port:user:pass"
+        )
+
+    logger.info(
+        "proxies_loaded",
+        file_path=file_path,
+        total=len(proxies),
+    )
+
+    return proxies
+
+
 class BrowserService:
     """Сервис для управления Playwright-браузером со stealth-режимом.
 
     Инкапсулирует всю логику работы с браузером: запуск, настройку
-    контекста, stealth-инъекции и имитацию поведения пользователя.
+    контекста, stealth-инъекции, ротацию прокси и имитацию поведения
+    пользователя.
 
     Attributes:
         _settings: Настройки браузера из конфигурации.
+        _proxy_settings: Настройки ротации прокси.
         _playwright: Экземпляр Playwright (async context manager).
         _browser: Экземпляр запущенного браузера.
         _context: Контекст браузера с настройками.
         _page: Активная страница.
+        _proxies: Список загруженных прокси.
+        _current_proxy_index: Индекс текущего прокси в списке.
+        _listings_since_rotation: Счётчик карточек с последней ротации.
     """
 
-    def __init__(self, settings: BrowserSettings) -> None:
+    def __init__(
+        self,
+        settings: BrowserSettings,
+        proxy_settings: ProxySettings,
+    ) -> None:
         """Инициализирует сервис.
 
         Args:
             settings: Настройки браузера (headless, таймауты).
+            proxy_settings: Настройки прокси (путь к файлу, порог ротации).
         """
         self._settings = settings
+        self._proxy_settings = proxy_settings
         self._playwright: object | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._proxies: list[ProxyInfo] = []
+        self._current_proxy_index: int = -1
+        self._listings_since_rotation: int = 0
+
+    def _load_proxies(self) -> None:
+        """Загружает прокси из файла, если путь указан в настройках.
+
+        При пустом пути — парсер работает без прокси.
+        Список перемешивается для равномерного использования.
+        """
+        if not self._proxy_settings.proxy_file_path:
+            logger.info("proxy_disabled_no_file")
+            return
+
+        self._proxies = _load_proxies_from_file(
+            self._proxy_settings.proxy_file_path
+        )
+
+        # Перемешиваем для равномерного распределения нагрузки
+        random.shuffle(self._proxies)
+
+        logger.info(
+            "proxies_ready",
+            total=len(self._proxies),
+            rotate_every=self._proxy_settings.rotate_every_n,
+        )
+
+    def _get_next_proxy(self) -> ProxyInfo | None:
+        """Возвращает следующий прокси из пула.
+
+        Циклически перебирает список прокси. Если прокси
+        закончились — начинает сначала.
+
+        Returns:
+            Следующий ProxyInfo или None, если прокси не загружены.
+        """
+        if not self._proxies:
+            return None
+
+        self._current_proxy_index += 1
+
+        # Циклический перебор
+        if self._current_proxy_index >= len(self._proxies):
+            self._current_proxy_index = 0
+            logger.info(
+                "proxy_pool_recycled",
+                total=len(self._proxies),
+            )
+
+        proxy = self._proxies[self._current_proxy_index]
+
+        logger.info(
+            "proxy_selected",
+            index=self._current_proxy_index,
+            total=len(self._proxies),
+            server=proxy.server,
+        )
+
+        return proxy
+
+    async def _create_context(
+        self, proxy: ProxyInfo | None = None
+    ) -> BrowserContext:
+        """Создаёт новый контекст браузера со stealth-настройками.
+
+        При каждом создании контекста рандомизируются User-Agent,
+        viewport и другие параметры для уникального fingerprint.
+
+        Args:
+            proxy: Прокси для контекста (None — без прокси).
+
+        Returns:
+            Новый BrowserContext.
+
+        Raises:
+            RuntimeError: Если браузер не запущен.
+        """
+        if self._browser is None:
+            raise RuntimeError(
+                "Браузер не запущен. Вызовите launch() перед "
+                "созданием контекста."
+            )
+
+        selected_ua = random.choice(USER_AGENTS)
+        viewport_width = random.randint(1024, 1920)
+        viewport_height = random.randint(768, 1080)
+
+        logger.info(
+            "context_creating",
+            user_agent=selected_ua[:60],
+            viewport=f"{viewport_width}x{viewport_height}",
+            proxy_server=proxy.server if proxy else "без прокси",
+        )
+
+        # Параметры контекста
+        context_kwargs: dict = {
+            "user_agent": selected_ua,
+            "viewport": {
+                "width": viewport_width,
+                "height": viewport_height,
+            },
+            "locale": "ru-RU",
+            "timezone_id": "Europe/Moscow",
+            "geolocation": {
+                "longitude": 37.6175,
+                "latitude": 55.7558,
+            },
+            "permissions": ["geolocation"],
+            "color_scheme": "light",
+            "device_scale_factor": 1,
+            "is_mobile": False,
+            "has_touch": False,
+            "extra_http_headers": {
+                "Accept": (
+                    "text/html,application/xhtml+xml,"
+                    "application/xml;q=0.9,image/webp,*/*;q=0.8"
+                ),
+                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Ch-Ua": (
+                    '"Not_A Brand";v="8", "Chromium";v="120"'
+                ),
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+            },
+        }
+
+        # Добавляем прокси, если указан
+        if proxy is not None:
+            context_kwargs["proxy"] = {
+                "server": proxy.server,
+                "username": proxy.username,
+                "password": proxy.password,
+            }
+
+        context = await self._browser.new_context(**context_kwargs)
+
+        context.set_default_timeout(
+            self._settings.navigation_timeout
+        )
+        context.set_default_navigation_timeout(
+            self._settings.navigation_timeout
+        )
+
+        return context
 
     async def launch(self) -> Page:
         """Запускает браузер, создаёт контекст и страницу.
 
-        Полный цикл инициализации: запуск Chromium с антидетект-аргументами,
-        создание контекста с рандомизированным User-Agent и viewport,
-        инъекция stealth-скриптов.
+        Полный цикл инициализации: загрузка прокси из файла,
+        запуск Chromium с антидетект-аргументами, создание контекста
+        с первым прокси (или без прокси), инъекция stealth-скриптов.
 
         Returns:
             Готовая к использованию страница Playwright.
@@ -133,6 +404,9 @@ class BrowserService:
             RuntimeError: Если не удалось запустить браузер.
         """
         try:
+            # Загружаем прокси из файла
+            self._load_proxies()
+
             pw = await async_playwright().start()
             self._playwright = pw
 
@@ -141,58 +415,27 @@ class BrowserService:
                 args=BROWSER_ARGS,
             )
 
-            selected_ua = random.choice(USER_AGENTS)
-            logger.info(
-                "browser_user_agent_selected",
-                user_agent=selected_ua[:60],
-            )
+            # Берём первый прокси (или None, если прокси отключены)
+            first_proxy = self._get_next_proxy()
 
-            self._context = await self._browser.new_context(
-                user_agent=selected_ua,
-                viewport={
-                    "width": random.randint(1024, 1920),
-                    "height": random.randint(768, 1080),
-                },
-                locale="ru-RU",
-                timezone_id="Europe/Moscow",
-                geolocation={"longitude": 37.6175, "latitude": 55.7558},
-                permissions=["geolocation"],
-                color_scheme="light",
-                device_scale_factor=1,
-                is_mobile=False,
-                has_touch=False,
-                extra_http_headers={
-                    "Accept": (
-                        "text/html,application/xhtml+xml,"
-                        "application/xml;q=0.9,image/webp,*/*;q=0.8"
-                    ),
-                    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120"',
-                    "Sec-Ch-Ua-Mobile": "?0",
-                    "Sec-Ch-Ua-Platform": '"Windows"',
-                    "Sec-Fetch-Dest": "document",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "none",
-                    "Sec-Fetch-User": "?1",
-                    "Upgrade-Insecure-Requests": "1",
-                },
-            )
-
-            self._context.set_default_timeout(
-                self._settings.navigation_timeout
-            )
-            self._context.set_default_navigation_timeout(
-                self._settings.navigation_timeout
+            self._context = await self._create_context(
+                proxy=first_proxy,
             )
 
             self._page = await self._context.new_page()
             await self._page.add_init_script(STEALTH_SCRIPT)
 
+            # Сбрасываем счётчик карточек
+            self._listings_since_rotation = 0
+
             logger.info(
                 "browser_launched",
                 headless=self._settings.headless,
                 timeout=self._settings.navigation_timeout,
+                proxy_enabled=len(self._proxies) > 0,
+                proxy_server=(
+                    first_proxy.server if first_proxy else "нет"
+                ),
             )
 
             return self._page
@@ -207,6 +450,116 @@ class BrowserService:
             raise RuntimeError(
                 f"Не удалось запустить браузер: {e}"
             ) from e
+
+    async def rotate_proxy(self) -> Page:
+        """Переключается на следующий прокси из пула.
+
+        Закрывает текущий контекст (cookies, session, fingerprint),
+        берёт следующий прокси, создаёт полностью новый контекст
+        с новым User-Agent, viewport и прокси. Chromium-процесс
+        НЕ перезапускается — пересоздаётся только BrowserContext.
+
+        Returns:
+            Новая страница Playwright с чистым контекстом.
+
+        Raises:
+            RuntimeError: Если прокси не загружены или браузер не запущен.
+        """
+        if not self._proxies:
+            raise RuntimeError(
+                "Ротация прокси невозможна: прокси не загружены. "
+                "Укажите PROXY_FILE_PATH в .env."
+            )
+
+        if self._browser is None:
+            raise RuntimeError(
+                "Ротация прокси невозможна: браузер не запущен."
+            )
+
+        old_proxy_index = self._current_proxy_index
+
+        # Закрываем текущий контекст (чистим cookies, session, fingerprint)
+        if self._context is not None:
+            try:
+                await self._context.close()
+            except Exception as e:
+                logger.warning(
+                    "context_close_error_during_rotation",
+                    error=str(e),
+                )
+            self._context = None
+            self._page = None
+
+        # Берём следующий прокси
+        next_proxy = self._get_next_proxy()
+
+        # Создаём полностью новый контекст
+        self._context = await self._create_context(proxy=next_proxy)
+
+        self._page = await self._context.new_page()
+        await self._page.add_init_script(STEALTH_SCRIPT)
+
+        # Сбрасываем счётчик карточек
+        self._listings_since_rotation = 0
+
+        logger.info(
+            "proxy_rotated",
+            old_index=old_proxy_index,
+            new_index=self._current_proxy_index,
+            new_server=next_proxy.server if next_proxy else "нет",
+            listings_before_rotation=self._listings_since_rotation,
+        )
+
+        # Пауза после смены прокси — имитация нового пользователя
+        pause = random.uniform(3.0, 6.0)
+        logger.debug(
+            "post_rotation_pause",
+            pause=round(pause, 1),
+        )
+        await asyncio.sleep(pause)
+
+        return self._page
+
+    async def increment_and_check_rotation(self) -> Page | None:
+        """Увеличивает счётчик карточек и проверяет необходимость ротации.
+
+        Вызывается после каждой успешно обработанной карточки.
+        Если счётчик достиг порога rotate_every_n — выполняет
+        ротацию прокси. Если прокси не загружены или порог = 0 —
+        ничего не делает.
+
+        Returns:
+            Новая Page после ротации, или None если ротация не нужна.
+        """
+        self._listings_since_rotation += 1
+
+        # Ротация отключена: прокси не загружены или порог = 0
+        if not self._proxies:
+            return None
+        if self._proxy_settings.rotate_every_n <= 0:
+            return None
+
+        # Порог не достигнут
+        if self._listings_since_rotation < self._proxy_settings.rotate_every_n:
+            return None
+
+        logger.info(
+            "rotation_threshold_reached",
+            listings_count=self._listings_since_rotation,
+            threshold=self._proxy_settings.rotate_every_n,
+        )
+
+        new_page = await self.rotate_proxy()
+        return new_page
+
+    @property
+    def has_proxies(self) -> bool:
+        """Проверяет, загружены ли прокси.
+
+        Returns:
+            True если список прокси не пуст.
+        """
+        return len(self._proxies) > 0
 
     async def navigate(self, url: str) -> bool:
         """Переходит по URL с предварительной задержкой и проверкой блокировки.

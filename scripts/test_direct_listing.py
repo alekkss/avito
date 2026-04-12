@@ -24,6 +24,7 @@ from playwright.async_api import Page
 from src.config import (
     BrowserSettings,
     ExportSettings,
+    ProxySettings,
     get_logger,
     setup_logging,
     set_trace_id,
@@ -50,6 +51,11 @@ DATEPICKER_OPEN_TIMEOUT: int = 5000
 
 # Максимальное количество переключений месяцев при навигации вперёд
 MAX_MONTH_SWITCHES: int = 4
+
+# CSS-селектор кнопки «Сбросить» в датепикере (основной)
+DATEPICKER_RESET_BUTTON_SELECTOR: str = (
+    "button._8761af61d40d8964.f6eebfeb30fe503c._793efba06309a0ff"
+)
 
 logger = get_logger("test_direct_listing")
 
@@ -151,6 +157,75 @@ async def _open_datepicker(page: Page) -> bool:
                 return True
             except Exception:
                 continue
+
+    return False
+
+
+async def _reset_datepicker(page: Page) -> bool:
+    """Нажимает кнопку «Сбросить» в открытом датепикере.
+
+    Гарантирует сброс ранее выбранных дат заезда/выезда
+    перед новым циклом выбора. Сначала ищет кнопку по
+    CSS-селектору, затем — фоллбэк по тексту, затем — через JS.
+
+    Args:
+        page: Активная страница Playwright.
+
+    Returns:
+        True если кнопка найдена и нажата.
+    """
+    # Способ 1: поиск по CSS-селектору кнопки «Сбросить»
+    try:
+        reset_btn = await page.query_selector(
+            DATEPICKER_RESET_BUTTON_SELECTOR
+        )
+        if reset_btn:
+            await reset_btn.click()
+            return True
+    except Exception:
+        pass
+
+    # Способ 2: поиск кнопки по тексту «Сбросить» внутри датепикера
+    try:
+        buttons = await page.query_selector_all(
+            "[data-marker='datepicker'] button"
+        )
+        for button in buttons:
+            try:
+                button_text = (await button.inner_text()).strip()
+                if "сбросить" in button_text.lower():
+                    await button.click()
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Способ 3: поиск через JavaScript по содержимому span
+    try:
+        reset_found: bool = await page.evaluate("""
+            () => {
+                const dp = document.querySelector(
+                    '[data-marker="datepicker"]'
+                );
+                if (!dp) return false;
+                const buttons = dp.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const spans = btn.querySelectorAll('span');
+                    for (const span of spans) {
+                        if (span.textContent.trim() === 'Сбросить') {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+        """)
+        if reset_found:
+            return True
+    except Exception:
+        pass
 
     return False
 
@@ -420,13 +495,15 @@ async def extract_prices_for_free_days(
 
     Для каждого свободного дня (calendar_60_days[i] == 0):
     1. Открывает датепикер.
-    2. Навигирует до месяца даты заезда.
-    3. Кликает на дату заезда (check-in).
-    4. Читает минимальный срок из текста датепикера.
-    5. Вычисляет дату выезда = заезд + мин. срок из датепикера.
-    6. Навигирует до месяца выезда, кликает дату выезда.
-    7. Читает цену из span[data-marker='item-view/item-price'].
-    8. Сбрасывает датепикер перед следующей итерацией.
+    2. Нажимает кнопку «Сбросить» для гарантированного
+       сброса ранее выбранных дат.
+    3. Навигирует до месяца даты заезда.
+    4. Кликает на дату заезда (check-in).
+    5. Читает минимальный срок из текста датепикера.
+    6. Вычисляет дату выезда = заезд + мин. срок из датепикера.
+    7. Навигирует до месяца выезда, кликает дату выезда.
+    8. Читает цену из span[data-marker='item-view/item-price'].
+    9. Сбрасывает датепикер перед следующей итерацией.
 
     Занятые дни получают цену 0.
 
@@ -462,7 +539,15 @@ async def extract_prices_for_free_days(
             end=" ",
         )
 
-        # --- Шаг 1: открыть датепикер ---
+        # --- Шаг 1: закрываем датепикер если открыт ---
+        existing_dp = await page.query_selector(
+            "[data-marker='datepicker']"
+        )
+        if existing_dp:
+            await _close_datepicker(page)
+            await asyncio.sleep(0.3)
+
+        # --- Шаг 2: открыть датепикер ---
         opened = await _open_datepicker(page)
         if not opened:
             print("датепикер не открылся → фоллбэк")
@@ -471,7 +556,11 @@ async def extract_prices_for_free_days(
 
         await asyncio.sleep(0.3)
 
-        # --- Шаг 2: навигация до месяца заезда ---
+        # --- Шаг 2.5: сброс датепикера кнопкой «Сбросить» ---
+        await _reset_datepicker(page)
+        await asyncio.sleep(0.3)
+
+        # --- Шаг 3: навигация до месяца заезда ---
         month_found = await _navigate_to_month(
             page, checkin.year, checkin.month
         )
@@ -484,7 +573,7 @@ async def extract_prices_for_free_days(
             prices[day_idx] = base_price
             continue
 
-        # --- Шаг 3: клик на дату заезда ---
+        # --- Шаг 4: клик на дату заезда ---
         clicked_in = await _click_day(
             page, checkin.year, checkin.month, checkin.day
         )
@@ -498,7 +587,7 @@ async def extract_prices_for_free_days(
 
         await asyncio.sleep(0.5)
 
-        # --- Шаг 4: читаем мин. срок из текста датепикера ---
+        # --- Шаг 5: читаем мин. срок из текста датепикера ---
         actual_min_stay = await _read_min_stay_from_datepicker(
             page, default_min_stay
         )
@@ -509,7 +598,7 @@ async def extract_prices_for_free_days(
             end=" → ",
         )
 
-        # --- Шаг 5: навигация до месяца выезда и клик ---
+        # --- Шаг 6: навигация до месяца выезда и клик ---
         if actual_min_stay >= 1:
             checkout_month_found = await _navigate_to_month(
                 page, checkout.year, checkout.month
@@ -531,7 +620,7 @@ async def extract_prices_for_free_days(
                     end=" → ",
                 )
 
-        # --- Шаг 6: читаем цену ---
+        # --- Шаг 7: читаем цену ---
         price = await _read_item_price(page)
         if price is not None:
             prices[day_idx] = price
@@ -540,7 +629,7 @@ async def extract_prices_for_free_days(
             prices[day_idx] = base_price
             print(f"цена не найдена → фоллбэк {base_price} руб.")
 
-        # --- Шаг 7: сброс датепикера ---
+        # --- Шаг 8: сброс датепикера ---
         await _close_datepicker(page)
         await asyncio.sleep(0.3)
 
@@ -592,10 +681,19 @@ async def run_direct_pipeline() -> None:
         page_wait_time=30000,
     )
 
+    # Тестовый скрипт работает без прокси
+    proxy_settings = ProxySettings(
+        proxy_file_path="",
+        rotate_every_n=0,
+    )
+
     repository = SQLiteListingRepository(db_path=TEST_DB_PATH)
     repository.initialize()
 
-    browser_service = BrowserService(settings=browser_settings)
+    browser_service = BrowserService(
+        settings=browser_settings,
+        proxy_settings=proxy_settings,
+    )
 
     try:
         # === ЭТАП 1: Запуск браузера и навигация ===

@@ -52,6 +52,9 @@ INSTANT_BOOK_BADGES: tuple[str, ...] = (
 # CSS-селектор рейтинга хоста в карточке каталога
 SELLER_SCORE_SELECTOR: str = "[data-marker='seller-info/score']"
 
+# URL для «прогрева» нового контекста после ротации прокси
+WARMUP_URL: str = "https://www.avito.ru"
+
 
 @dataclass
 class CatalogItem:
@@ -93,7 +96,7 @@ class ScraperService:
     Координирует работу BrowserService для навигации, извлекает
     базовые данные из каталога и запускает детальный парсинг
     карточек через ListingService. Поддерживает пагинацию,
-    обнаружение циклов и батчевое сохранение.
+    обнаружение циклов, ротацию прокси и батчевое сохранение.
 
     Attributes:
         _browser_service: Сервис управления браузером.
@@ -451,6 +454,40 @@ class ScraperService:
         )
         return False
 
+    async def _warmup_after_rotation(self, page: Page) -> None:
+        """Прогревает новый контекст после ротации прокси.
+
+        Заходит на главную страницу Avito, чтобы новый контекст
+        получил cookies и выглядел как обычный пользователь.
+        Это снижает вероятность бана на первой же карточке.
+
+        Args:
+            page: Новая страница после ротации.
+        """
+        try:
+            logger.info(
+                "warmup_started",
+                url=WARMUP_URL,
+            )
+
+            await page.goto(
+                WARMUP_URL,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+
+            # Имитируем короткое пребывание на главной
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+            await self._browser_service.simulate_human_behavior()
+
+            logger.info("warmup_completed")
+
+        except Exception as e:
+            logger.warning(
+                "warmup_failed",
+                error=str(e),
+            )
+
     async def scrape_all(self) -> list[RawListing]:
         """Парсит все страницы каталога и карточки объявлений.
 
@@ -633,6 +670,10 @@ class ScraperService:
     ) -> list[RawListing]:
         """Парсит детальные карточки всех объявлений.
 
+        После каждой успешно обработанной карточки проверяет
+        необходимость ротации прокси по счётчику. При ротации
+        прогревает новый контекст и продолжает обход.
+
         Args:
             page: Активная страница Playwright.
             catalog_items: Список базовых данных из каталога.
@@ -642,6 +683,9 @@ class ScraperService:
         """
         all_listings: list[RawListing] = []
         total = len(catalog_items)
+
+        # Используем текущую page, которая может обновиться при ротации
+        current_page = page
 
         for index, item in enumerate(catalog_items, start=1):
             logger.info(
@@ -654,7 +698,7 @@ class ScraperService:
             )
 
             listing = await self._listing_service.parse_listing(
-                page=page,
+                page=current_page,
                 external_id=item.external_id,
                 url=item.url,
                 title=item.title,
@@ -682,6 +726,29 @@ class ScraperService:
                     external_id=item.external_id,
                     url=item.url[:100],
                 )
+
+            # После каждой карточки — обновляем current_page
+            # (мог измениться после ротации внутри listing_service)
+            if self._browser_service.page is not None:
+                current_page = self._browser_service.page
+
+            # Проверяем необходимость плановой ротации прокси по счётчику
+            new_page = await self._browser_service.increment_and_check_rotation()
+            if new_page is not None:
+                logger.info(
+                    "proxy_rotated_by_counter",
+                    progress=f"{index}/{total}",
+                    listings_processed=index,
+                )
+                print(
+                    f"\n  [прокси] Плановая смена прокси после "
+                    f"{index} карточек"
+                )
+
+                current_page = new_page
+
+                # Прогреваем новый контекст
+                await self._warmup_after_rotation(current_page)
 
             if index % 10 == 0:
                 logger.info(

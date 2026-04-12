@@ -95,6 +95,22 @@ class LogSettings:
 
 
 @dataclass(frozen=True)
+class ProxySettings:
+    """Настройки ротации прокси.
+
+    Attributes:
+        proxy_file_path: Путь к файлу со списком прокси
+            (формат: host:port:user:pass). Пустая строка — прокси отключены.
+        rotate_every_n: Менять прокси каждые N обработанных карточек.
+            0 — автоматическая ротация по счётчику отключена
+            (ротация только при бане).
+    """
+
+    proxy_file_path: str
+    rotate_every_n: int
+
+
+@dataclass(frozen=True)
 class Settings:
     """Корневой объект конфигурации приложения.
 
@@ -106,6 +122,7 @@ class Settings:
         database: Настройки базы данных.
         export: Настройки экспорта.
         log: Настройки логирования.
+        proxy: Настройки ротации прокси.
     """
 
     browser: BrowserSettings
@@ -113,6 +130,7 @@ class Settings:
     database: DatabaseSettings
     export: ExportSettings
     log: LogSettings
+    proxy: ProxySettings
 
 
 def _parse_bool(value: str) -> bool:
@@ -234,6 +252,37 @@ def _validate_non_negative_int(value: int, param_name: str) -> int:
     return value
 
 
+def _validate_proxy_file(path: str) -> str:
+    """Проверяет существование файла прокси, если путь указан.
+
+    Args:
+        path: Путь к файлу прокси.
+
+    Returns:
+        Валидированный путь к файлу.
+
+    Raises:
+        ConfigValidationError: Если файл не найден.
+    """
+    if not path:
+        return path
+
+    proxy_path = Path(path)
+    if not proxy_path.exists():
+        raise ConfigValidationError(
+            f"Файл прокси не найден по пути '{path}'. "
+            f"Создайте файл или оставьте PROXY_FILE_PATH пустым "
+            f"для работы без прокси."
+        )
+
+    if not proxy_path.is_file():
+        raise ConfigValidationError(
+            f"Путь '{path}' не является файлом."
+        )
+
+    return path
+
+
 def load_settings() -> Settings:
     """Загружает и валидирует все настройки приложения.
 
@@ -310,6 +359,25 @@ def load_settings() -> Settings:
         errors.append(str(e))
         log_level = "INFO"
 
+    # --- Прокси ---
+    proxy_file_path_raw = os.getenv("PROXY_FILE_PATH", "")
+    rotate_every_n_raw = os.getenv("ROTATE_EVERY_N_LISTINGS", "70")
+
+    try:
+        proxy_file_path = _validate_proxy_file(proxy_file_path_raw)
+    except ConfigValidationError as e:
+        errors.append(str(e))
+        proxy_file_path = ""
+
+    try:
+        rotate_every_n = _validate_non_negative_int(
+            _parse_int(rotate_every_n_raw, "ROTATE_EVERY_N_LISTINGS"),
+            "ROTATE_EVERY_N_LISTINGS",
+        )
+    except ConfigValidationError as e:
+        errors.append(str(e))
+        rotate_every_n = 70
+
     # --- Если есть ошибки — выбрасываем все разом ---
     if errors:
         error_message = "Ошибки конфигурации:\n" + "\n".join(
@@ -336,5 +404,9 @@ def load_settings() -> Settings:
         log=LogSettings(
             level=log_level,
             file_path=log_file_path,
+        ),
+        proxy=ProxySettings(
+            proxy_file_path=proxy_file_path,
+            rotate_every_n=rotate_every_n,
         ),
     )

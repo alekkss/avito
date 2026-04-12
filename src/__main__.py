@@ -53,13 +53,20 @@ def create_repository(settings: Settings) -> SQLiteListingRepository:
 def create_browser_service(settings: Settings) -> BrowserService:
     """Создаёт сервис управления браузером.
 
+    Передаёт настройки браузера и прокси. BrowserService
+    загрузит прокси из файла при запуске (launch),
+    если путь указан в proxy settings.
+
     Args:
         settings: Настройки приложения.
 
     Returns:
         Экземпляр BrowserService.
     """
-    return BrowserService(settings=settings.browser)
+    return BrowserService(
+        settings=settings.browser,
+        proxy_settings=settings.proxy,
+    )
 
 
 def create_listing_service(
@@ -142,6 +149,8 @@ async def run_pipeline(settings: Settings) -> None:
             "stage_started",
             stage="scraping",
             url=settings.scraper.category_url,
+            proxy_enabled=bool(settings.proxy.proxy_file_path),
+            rotate_every=settings.proxy.rotate_every_n,
         )
 
         listing_service = create_listing_service(
@@ -219,6 +228,8 @@ def main() -> None:
         trace_id=trace_id,
         category_url=settings.scraper.category_url,
         max_pages=settings.scraper.max_pages,
+        proxy_enabled=bool(settings.proxy.proxy_file_path),
+        rotate_every=settings.proxy.rotate_every_n,
     )
 
     try:
