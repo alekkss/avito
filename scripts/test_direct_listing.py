@@ -2,9 +2,9 @@
 
 Переходит напрямую на страницу конкретного объявления Avito
 (без обхода каталога), извлекает все детальные данные карточки
-(координаты, календарь, мин. срок, рейтинг, мгновенное бронирование),
-затем извлекает реальные цены через датепикер для каждого свободного
-дня и экспортирует результат в отдельные тестовую БД и Excel-файл.
+через ListingService (координаты, календарь, цены через датепикер,
+мин. срок, рейтинг, мгновенное бронирование) и экспортирует
+результат в отдельные тестовую БД и Excel-файл.
 
 Запуск:
     python scripts/test_direct_listing.py
@@ -13,7 +13,6 @@
 import asyncio
 import re
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -46,22 +45,11 @@ DIRECT_LISTING_URL: str = (
 TEST_DB_PATH: str = "data/test_direct_listing.db"
 TEST_EXPORT_PATH: str = "data/test_direct_listing.xlsx"
 
-# Таймаут ожидания датепикера после клика (мс)
-DATEPICKER_OPEN_TIMEOUT: int = 5000
-
-# Максимальное количество переключений месяцев при навигации вперёд
-MAX_MONTH_SWITCHES: int = 4
-
-# CSS-селектор кнопки «Сбросить» в датепикере (основной)
-DATEPICKER_RESET_BUTTON_SELECTOR: str = (
-    "button._8761af61d40d8964.f6eebfeb30fe503c._793efba06309a0ff"
-)
-
 logger = get_logger("test_direct_listing")
 
 
 # ============================================================
-# Вспомогательные функции: ID из URL
+# Вспомогательные функции: ID и название из URL
 # ============================================================
 
 
@@ -120,290 +108,8 @@ def _extract_title_from_url(url: str) -> str:
 
 
 # ============================================================
-# Вспомогательные функции: работа с датепикером
+# Вспомогательные функции: чтение базовой цены
 # ============================================================
-
-
-async def _open_datepicker(page: Page) -> bool:
-    """Открывает датепикер кликом на поле ввода даты.
-
-    Если датепикер уже открыт — возвращает True без клика.
-
-    Returns:
-        True если датепикер успешно открыт.
-    """
-    existing = await page.query_selector("[data-marker='datepicker']")
-    if existing:
-        return True
-
-    input_selectors = [
-        "input[placeholder*='Заезд']",
-        "input[placeholder*='заезд']",
-        "[data-marker='datepicker'] input",
-        "input[placeholder*='дата']",
-        "input[placeholder*='Дата']",
-        "[data-marker*='booking'] input",
-    ]
-
-    for sel in input_selectors:
-        el = await page.query_selector(sel)
-        if el:
-            await el.click()
-            try:
-                await page.wait_for_selector(
-                    "[data-marker='datepicker']",
-                    timeout=DATEPICKER_OPEN_TIMEOUT,
-                )
-                return True
-            except Exception:
-                continue
-
-    return False
-
-
-async def _reset_datepicker(page: Page) -> bool:
-    """Нажимает кнопку «Сбросить» в открытом датепикере.
-
-    Гарантирует сброс ранее выбранных дат заезда/выезда
-    перед новым циклом выбора. Сначала ищет кнопку по
-    CSS-селектору, затем — фоллбэк по тексту, затем — через JS.
-
-    Args:
-        page: Активная страница Playwright.
-
-    Returns:
-        True если кнопка найдена и нажата.
-    """
-    # Способ 1: поиск по CSS-селектору кнопки «Сбросить»
-    try:
-        reset_btn = await page.query_selector(
-            DATEPICKER_RESET_BUTTON_SELECTOR
-        )
-        if reset_btn:
-            await reset_btn.click()
-            return True
-    except Exception:
-        pass
-
-    # Способ 2: поиск кнопки по тексту «Сбросить» внутри датепикера
-    try:
-        buttons = await page.query_selector_all(
-            "[data-marker='datepicker'] button"
-        )
-        for button in buttons:
-            try:
-                button_text = (await button.inner_text()).strip()
-                if "сбросить" in button_text.lower():
-                    await button.click()
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # Способ 3: поиск через JavaScript по содержимому span
-    try:
-        reset_found: bool = await page.evaluate("""
-            () => {
-                const dp = document.querySelector(
-                    '[data-marker="datepicker"]'
-                );
-                if (!dp) return false;
-                const buttons = dp.querySelectorAll('button');
-                for (const btn of buttons) {
-                    const spans = btn.querySelectorAll('span');
-                    for (const span of spans) {
-                        if (span.textContent.trim() === 'Сбросить') {
-                            btn.click();
-                            return true;
-                        }
-                    }
-                }
-                return false;
-            }
-        """)
-        if reset_found:
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-async def _close_datepicker(page: Page) -> None:
-    """Сбрасывает выбор и закрывает датепикер.
-
-    Пробует последовательно: кнопка «Сбросить» → Escape → клик вне.
-    """
-    try:
-        buttons = await page.query_selector_all(
-            "[data-marker='datepicker'] button"
-        )
-        for btn in buttons:
-            try:
-                text = (await btn.inner_text()).strip().lower()
-                if "сброс" in text or "очист" in text:
-                    await btn.click()
-                    await asyncio.sleep(0.4)
-                    return
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    try:
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(0.3)
-    except Exception:
-        pass
-
-    try:
-        await page.click("body", position={"x": 10, "y": 10})
-        await asyncio.sleep(0.3)
-    except Exception:
-        pass
-
-
-async def _navigate_to_month(
-    page: Page, target_year: int, target_month: int
-) -> bool:
-    """Листает датепикер вперёд до нужного месяца.
-
-    Датепикер Avito использует 0-indexed месяц в атрибуте
-    data-marker (JS Date формат): апрель → 3, январь → 0.
-
-    Args:
-        target_year: Год (4 цифры).
-        target_month: Месяц (1-12, обычный формат).
-
-    Returns:
-        True если нужный месяц стал видимым.
-    """
-    target_month_0 = target_month - 1
-
-    for _ in range(MAX_MONTH_SWITCHES):
-        is_visible: bool = await page.evaluate(
-            f"() => !!document.querySelector("
-            f"'[data-marker=\"datepicker/calendar"
-            f"({target_year}-{target_month_0})\"]')"
-        )
-        if is_visible:
-            return True
-
-        next_btn = await page.query_selector(
-            "[data-marker='datepicker/next-button']"
-        )
-        if not next_btn:
-            return False
-
-        disabled = await next_btn.get_attribute("disabled")
-        if disabled is not None:
-            return False
-
-        await next_btn.click()
-        await asyncio.sleep(0.4)
-
-    return False
-
-
-async def _click_day(
-    page: Page, target_year: int, target_month: int, target_day: int
-) -> bool:
-    """Кликает на доступный день в видимом месяце датепикера.
-
-    Args:
-        target_year: Год.
-        target_month: Месяц (1-12).
-        target_day: День месяца.
-
-    Returns:
-        True если клик выполнен успешно.
-    """
-    target_month_0 = target_month - 1
-
-    el_handle = await page.evaluate_handle(
-        f"""() => {{
-            const cal = document.querySelector(
-                '[data-marker="datepicker/calendar'
-                + '({target_year}-{target_month_0})"]'
-            );
-            if (!cal) return null;
-
-            const dayContents = cal.querySelectorAll(
-                '[data-marker="datepicker/content"]'
-            );
-            for (const dayEl of dayContents) {{
-                const inner = dayEl.querySelector(
-                    '[data-marker="datepicker-day-available"]'
-                );
-                if (!inner) continue;
-                if (parseInt(inner.textContent.trim()) === {target_day}) {{
-                    return inner;
-                }}
-            }}
-            return null;
-        }}"""
-    )
-
-    try:
-        el = el_handle.as_element()
-        if el:
-            await el.click()
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-async def _read_min_stay_from_datepicker(
-    page: Page, default_min_stay: int
-) -> int:
-    """Читает минимальный срок аренды из текста датепикера.
-
-    После клика на дату заезда Avito отображает в датепикере
-    текст вида «Бронь минимум от N суток» (или «ночей», «дней»).
-    Функция извлекает число N из этого текста.
-
-    Args:
-        page: Активная страница Playwright.
-        default_min_stay: Фоллбэк-значение мин. срока.
-
-    Returns:
-        Минимальный срок аренды в сутках.
-    """
-    try:
-        datepicker_el = await page.query_selector(
-            "[data-marker='datepicker']"
-        )
-        if not datepicker_el:
-            return default_min_stay
-
-        dp_text = (await datepicker_el.inner_text()).strip()
-
-        patterns = [
-            r"(?:бронь|бронирование)\s+минимум\s+от\s+(\d+)\s*"
-            r"(?:суток|сут\.|ноч[еёий]*|дн[яей]*)",
-            r"(?:минимум|мин\.?)\s*(?:от\s*)?(\d+)\s*"
-            r"(?:суток|сут\.|ноч[еёий]*|дн[яей]*)",
-            r"(?:от|мин[.\s]*срок[а]?)\s*(\d+)\s*"
-            r"(?:суток|сут\.|ноч[еёий]*|дн[яей]*)",
-            r"минимальн\w*\s*(?:срок\w*)?\s*(\d+)\s*"
-            r"(?:суток|сут\.|ноч[еёий]*|дн[яей]*)",
-            r"(\d+)\s*(?:суток|сут\.)\s*(?:минимум|мин\.?)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, dp_text, re.IGNORECASE)
-            if match:
-                value = int(match.group(1))
-                if 1 <= value <= 365:
-                    return value
-
-    except Exception:
-        pass
-
-    return default_min_stay
 
 
 async def _read_item_price(page: Page) -> int | None:
@@ -481,168 +187,6 @@ async def _read_base_price(page: Page) -> int:
 
 
 # ============================================================
-# Извлечение реальных цен через датепикер
-# ============================================================
-
-
-async def extract_prices_for_free_days(
-    page: Page,
-    calendar_60_days: list[int],
-    default_min_stay: int,
-    base_price: int,
-) -> list[int]:
-    """Извлекает реальные цены для каждого свободного дня через датепикер.
-
-    Для каждого свободного дня (calendar_60_days[i] == 0):
-    1. Открывает датепикер.
-    2. Нажимает кнопку «Сбросить» для гарантированного
-       сброса ранее выбранных дат.
-    3. Навигирует до месяца даты заезда.
-    4. Кликает на дату заезда (check-in).
-    5. Читает минимальный срок из текста датепикера.
-    6. Вычисляет дату выезда = заезд + мин. срок из датепикера.
-    7. Навигирует до месяца выезда, кликает дату выезда.
-    8. Читает цену из span[data-marker='item-view/item-price'].
-    9. Сбрасывает датепикер перед следующей итерацией.
-
-    Занятые дни получают цену 0.
-
-    Args:
-        page: Активная страница Playwright.
-        calendar_60_days: Массив занятости 60 дней (0 — свободен,
-                          1 — занят).
-        default_min_stay: Фоллбэк мин. срока аренды.
-        base_price: Цена-фоллбэк из карточки при ошибке чтения.
-
-    Returns:
-        Массив цен на 60 дней: 0 для занятых, реальная цена для
-        свободных (или base_price при ошибке).
-    """
-    today = date.today()
-    prices: list[int] = [0] * 60
-
-    free_days = [i for i in range(60) if calendar_60_days[i] == 0]
-    print(
-        f"\n[цены] Свободных дней: {len(free_days)} из 60 "
-        f"→ начинаю обход датепикера"
-    )
-    print(
-        f"[цены] Фоллбэк мин. срока (из карточки): "
-        f"{default_min_stay} сут."
-    )
-
-    for day_idx in free_days:
-        checkin = today + timedelta(days=day_idx)
-
-        print(
-            f"  [день {day_idx:02d}] заезд {checkin} ...",
-            end=" ",
-        )
-
-        # --- Шаг 1: закрываем датепикер если открыт ---
-        existing_dp = await page.query_selector(
-            "[data-marker='datepicker']"
-        )
-        if existing_dp:
-            await _close_datepicker(page)
-            await asyncio.sleep(0.3)
-
-        # --- Шаг 2: открыть датепикер ---
-        opened = await _open_datepicker(page)
-        if not opened:
-            print("датепикер не открылся → фоллбэк")
-            prices[day_idx] = base_price
-            continue
-
-        await asyncio.sleep(0.3)
-
-        # --- Шаг 2.5: сброс датепикера кнопкой «Сбросить» ---
-        await _reset_datepicker(page)
-        await asyncio.sleep(0.3)
-
-        # --- Шаг 3: навигация до месяца заезда ---
-        month_found = await _navigate_to_month(
-            page, checkin.year, checkin.month
-        )
-        if not month_found:
-            print(
-                f"месяц {checkin.month}/{checkin.year} не найден "
-                f"→ фоллбэк"
-            )
-            await _close_datepicker(page)
-            prices[day_idx] = base_price
-            continue
-
-        # --- Шаг 4: клик на дату заезда ---
-        clicked_in = await _click_day(
-            page, checkin.year, checkin.month, checkin.day
-        )
-        if not clicked_in:
-            print(
-                f"дата заезда {checkin.day} не кликнута → фоллбэк"
-            )
-            await _close_datepicker(page)
-            prices[day_idx] = base_price
-            continue
-
-        await asyncio.sleep(0.5)
-
-        # --- Шаг 5: читаем мин. срок из текста датепикера ---
-        actual_min_stay = await _read_min_stay_from_datepicker(
-            page, default_min_stay
-        )
-        checkout = checkin + timedelta(days=actual_min_stay)
-
-        print(
-            f"мин.срок={actual_min_stay} сут. → выезд {checkout}",
-            end=" → ",
-        )
-
-        # --- Шаг 6: навигация до месяца выезда и клик ---
-        if actual_min_stay >= 1:
-            checkout_month_found = await _navigate_to_month(
-                page, checkout.year, checkout.month
-            )
-            if checkout_month_found:
-                clicked_out = await _click_day(
-                    page, checkout.year, checkout.month, checkout.day
-                )
-                if not clicked_out:
-                    print(
-                        f"дата выезда {checkout} не кликнута",
-                        end=" → ",
-                    )
-                await asyncio.sleep(0.5)
-            else:
-                print(
-                    f"месяц выезда {checkout.month}/{checkout.year} "
-                    f"не найден",
-                    end=" → ",
-                )
-
-        # --- Шаг 7: читаем цену ---
-        price = await _read_item_price(page)
-        if price is not None:
-            prices[day_idx] = price
-            print(f"цена: {price} руб.")
-        else:
-            prices[day_idx] = base_price
-            print(f"цена не найдена → фоллбэк {base_price} руб.")
-
-        # --- Шаг 8: сброс датепикера ---
-        await _close_datepicker(page)
-        await asyncio.sleep(0.3)
-
-    filled = sum(1 for i in free_days if prices[i] > 0)
-    print(
-        f"\n[цены] Готово: {filled}/{len(free_days)} "
-        f"свободных дней получили цену"
-    )
-
-    return prices
-
-
-# ============================================================
 # Основной конвейер
 # ============================================================
 
@@ -652,11 +196,11 @@ async def run_direct_pipeline() -> None:
 
     Этапы:
     1. Запускает браузер и переходит на страницу объявления.
-    2. Извлекает базовую цену со страницы.
-    3. Извлекает все детальные данные через ListingService.
-    4. Извлекает реальные цены через датепикер.
-    5. Сохраняет в тестовую БД SQLite.
-    6. Экспортирует в тестовый Excel-файл.
+    2. Извлекает базовую цену и название со страницы.
+    3. Извлекает все детальные данные через ListingService
+       (координаты, календарь, цены через датепикер, мин. срок).
+    4. Сохраняет в тестовую БД SQLite.
+    5. Экспортирует в тестовый Excel-файл.
     """
     # --- Извлекаем ID и название из URL ---
     try:
@@ -722,7 +266,7 @@ async def run_direct_pipeline() -> None:
         await browser_service.simulate_human_behavior()
         print("[этап 1] Страница объявления загружена успешно.\n")
 
-        # === ЭТАП 2: Чтение базовой цены со страницы ===
+        # === ЭТАП 2: Чтение базовой цены и названия ===
         print("[этап 2] Чтение базовой цены со страницы...")
 
         base_price = await _read_base_price(page)
@@ -749,8 +293,14 @@ async def run_direct_pipeline() -> None:
         except Exception:
             print(f"  Название:     {approx_title} (из URL)")
 
-        # === ЭТАП 3: Детальный парсинг карточки через ListingService ===
-        print("\n[этап 3] Парсинг карточки объявления (ListingService)...")
+        # === ЭТАП 3: Полный парсинг карточки через ListingService ===
+        # ListingService.parse_listing() выполняет всё:
+        # координаты, календарь, мин. срок, цены через датепикер,
+        # рейтинг хоста, мгновенное бронирование.
+        print(
+            "\n[этап 3] Парсинг карточки объявления "
+            "(ListingService — координаты, календарь, цены)..."
+        )
 
         listing_service = ListingService(browser_service=browser_service)
 
@@ -793,6 +343,10 @@ async def run_direct_pipeline() -> None:
             f"{listing.latitude}, {listing.longitude}"
         )
         print(f"    Мин. срок:        {listing.min_stay} сут.")
+        print(
+            f"    Средняя цена:     "
+            f"{round(listing.average_price)} руб./сут."
+        )
         print(f"    Занятость:        {listing.occupancy_rate:.1%}")
         print(
             f"    Мгновенная бронь: "
@@ -803,65 +357,11 @@ async def run_direct_pipeline() -> None:
             f"    Последнее обновление: "
             f"{listing.last_host_update or 'Не найдено'}"
         )
-        print(f"    Цены (фоллбэк, 7): {listing.price_60_days[:7]}")
-        print(f"    Календарь (14):    {listing.calendar_60_days[:14]}")
-
-        # === ЭТАП 4: Возврат на страницу объявления для датепикера ===
-        #
-        # ListingService.parse_listing() делает page.goto() внутри,
-        # поэтому мы уже на странице карточки. Но на всякий случай
-        # убеждаемся, что находимся на нужной странице.
-        print(
-            f"\n[этап 4] Извлечение реальных цен через датепикер..."
-        )
-        print(
-            f"  Фоллбэк мин. срока (из карточки): "
-            f"{listing.min_stay} сут."
-        )
-        print(
-            "  Для каждой даты мин. срок будет прочитан "
-            "из датепикера индивидуально"
-        )
-
-        # Проверяем, что мы на странице карточки
-        current_url = page.url
-        if external_id.replace("av_", "") not in current_url:
-            print(
-                "  Переход обратно на страницу объявления..."
-            )
-            await page.goto(
-                DIRECT_LISTING_URL,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            await asyncio.sleep(3.0)
-
-        real_prices = await extract_prices_for_free_days(
-            page=page,
-            calendar_60_days=listing.calendar_60_days,
-            default_min_stay=listing.min_stay,
-            base_price=base_price,
-        )
-
-        # Обновляем цены в объекте listing
-        listing.price_60_days = real_prices
-
-        logger.info(
-            "direct_test_prices_extracted",
-            external_id=listing.external_id,
-            prices_filled=sum(1 for p in real_prices if p > 0),
-            avg_price=round(listing.average_price),
-        )
-
-        print(f"\n  Цены обновлены:")
-        print(
-            f"    Средняя цена:    "
-            f"{round(listing.average_price)} руб./сут."
-        )
         print(f"    Цены (первые 14): {listing.price_60_days[:14]}")
+        print(f"    Календарь (14):   {listing.calendar_60_days[:14]}")
 
-        # === ЭТАП 5: Сохранение в тестовую БД ===
-        print(f"\n[этап 5] Сохранение в тестовую БД...")
+        # === ЭТАП 4: Сохранение в тестовую БД ===
+        print(f"\n[этап 4] Сохранение в тестовую БД...")
 
         repository.save_listing(listing)
 
@@ -875,8 +375,8 @@ async def run_direct_pipeline() -> None:
             f"  Сохранено: {TEST_DB_PATH} (записей: {db_count})"
         )
 
-        # === ЭТАП 6: Экспорт в тестовый Excel ===
-        print(f"\n[этап 6] Экспорт в Excel...")
+        # === ЭТАП 5: Экспорт в тестовый Excel ===
+        print(f"\n[этап 5] Экспорт в Excel...")
 
         test_export_settings = ExportSettings(
             export_path=TEST_EXPORT_PATH,

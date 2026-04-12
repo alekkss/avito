@@ -161,6 +161,14 @@ DATEPICKER_DAY_AVAILABLE_MARKER: str = "datepicker-day-available"
 DATEPICKER_RESET_BUTTON_SELECTOR: str = (
     "button._8761af61d40d8964.f6eebfeb30fe503c._793efba06309a0ff"
 )
+# Селектор карусели ближайших дат (появляется после выбора заезда и выезда)
+NEAREST_DATES_SELECTOR: str = "ul[role='listbox'][data-marker='nearest-dates']"
+
+# Максимальное количество повторных попыток выбора дат при отсутствии карусели
+MAX_DATE_SELECTION_RETRIES: int = 3
+
+# Таймаут ожидания появления карусели ближайших дат (мс)
+NEAREST_DATES_TIMEOUT: int = 3000
 
 
 def _clean_listing_url(url: str) -> str:
@@ -366,8 +374,10 @@ class ListingService:
         5. Читает мин. срок из текста датепикера.
         6. Вычисляет дату выезда = заезд + мин. срок.
         7. Листает до месяца выезда, кликает дату выезда.
-        8. Читает цену из элемента цены на странице.
-        9. Полностью сбрасывает и закрывает датепикер.
+        8. Проверяет появление карусели nearest-dates —
+           если нет, повторяет весь цикл (до 3 попыток).
+        9. Читает цену из элемента цены на странице.
+        10. Полностью сбрасывает и закрывает датепикер.
 
         Занятые дни получают цену 0.
 
@@ -405,106 +415,134 @@ class ListingService:
 
         for day_idx in free_days:
             checkin = today + timedelta(days=day_idx)
+            day_price: int | None = None
 
-            # --- Шаг 1: Полный сброс — закрываем датепикер если открыт ---
-            # Это гарантирует чистое состояние перед каждой датой
-            existing_dp = await page.query_selector(
-                DATEPICKER_CONTAINER_SELECTOR
-            )
-            if existing_dp:
-                await self._close_datepicker(page)
+            for attempt in range(1, MAX_DATE_SELECTION_RETRIES + 1):
+                # --- Шаг 1: Закрываем датепикер если открыт ---
+                existing_dp = await page.query_selector(
+                    DATEPICKER_CONTAINER_SELECTOR
+                )
+                if existing_dp:
+                    await self._close_datepicker(page)
+                    await asyncio.sleep(0.3)
+
+                # --- Шаг 2: Открываем датепикер заново ---
+                opened = await self._open_datepicker(page, external_id)
+                if not opened:
+                    logger.debug(
+                        "prices_datepicker_not_opened",
+                        external_id=external_id,
+                        day_idx=day_idx,
+                        attempt=attempt,
+                    )
+                    break
+
                 await asyncio.sleep(0.3)
 
-            # --- Шаг 2: Открываем датепикер заново ---
-            opened = await self._open_datepicker(page, external_id)
-            if not opened:
-                logger.debug(
-                    "prices_datepicker_not_opened",
-                    external_id=external_id,
-                    day_idx=day_idx,
+                # --- Шаг 3: Сбрасываем датепикер кнопкой «Сбросить» ---
+                await self._reset_datepicker(page, external_id)
+                await asyncio.sleep(0.3)
+
+                # --- Шаг 4: Листаем до месяца заезда ---
+                month_found = await self._navigate_datepicker_to_month(
+                    page, checkin.year, checkin.month
                 )
-                prices[day_idx] = base_price
-                continue
-
-            await asyncio.sleep(0.3)
-
-            # --- Шаг 2.5: Сбрасываем датепикер кнопкой «Сбросить» ---
-            # Гарантирует, что предыдущий выбор дат полностью очищен
-            await self._reset_datepicker(page, external_id)
-            await asyncio.sleep(0.3)
-
-            # --- Шаг 3: Листаем до месяца заезда ---
-            month_found = await self._navigate_datepicker_to_month(
-                page, checkin.year, checkin.month
-            )
-            if not month_found:
-                logger.debug(
-                    "prices_month_not_found",
-                    external_id=external_id,
-                    month=f"{checkin.year}-{checkin.month:02d}",
-                )
-                await self._close_datepicker(page)
-                prices[day_idx] = base_price
-                continue
-
-            # --- Шаг 4: Кликаем на дату заезда ---
-            clicked_in = await self._click_datepicker_day(
-                page, checkin.year, checkin.month, checkin.day
-            )
-            if not clicked_in:
-                logger.debug(
-                    "prices_checkin_click_failed",
-                    external_id=external_id,
-                    checkin=str(checkin),
-                )
-                await self._close_datepicker(page)
-                prices[day_idx] = base_price
-                continue
-
-            await asyncio.sleep(0.5)
-
-            # --- Шаг 5: Читаем мин. срок из текста датепикера ---
-            actual_min_stay = await self._read_min_stay_from_datepicker(
-                page, min_stay
-            )
-            checkout = checkin + timedelta(days=actual_min_stay)
-
-            # --- Шаг 6: Листаем до месяца выезда и кликаем ---
-            checkout_month_found = (
-                await self._navigate_datepicker_to_month(
-                    page, checkout.year, checkout.month
-                )
-            )
-            if checkout_month_found:
-                clicked_out = await self._click_datepicker_day(
-                    page, checkout.year, checkout.month, checkout.day
-                )
-                if not clicked_out:
+                if not month_found:
                     logger.debug(
-                        "prices_checkout_click_failed",
+                        "prices_month_not_found",
                         external_id=external_id,
-                        checkout=str(checkout),
+                        month=f"{checkin.year}-{checkin.month:02d}",
+                        attempt=attempt,
                     )
+                    await self._close_datepicker(page)
+                    break
+
+                # --- Шаг 5: Кликаем на дату заезда ---
+                clicked_in = await self._click_datepicker_day(
+                    page, checkin.year, checkin.month, checkin.day
+                )
+                if not clicked_in:
+                    logger.debug(
+                        "prices_checkin_click_failed",
+                        external_id=external_id,
+                        checkin=str(checkin),
+                        attempt=attempt,
+                    )
+                    await self._close_datepicker(page)
+                    continue
+
                 await asyncio.sleep(0.5)
 
-            # --- Шаг 7: Читаем цену ---
-            price = await self._read_item_price(page)
-            if price is not None and price > 0:
-                prices[day_idx] = price
+                # --- Шаг 6: Читаем мин. срок из текста датепикера ---
+                actual_min_stay = (
+                    await self._read_min_stay_from_datepicker(
+                        page, min_stay
+                    )
+                )
+                checkout = checkin + timedelta(days=actual_min_stay)
+
+                # --- Шаг 7: Листаем до месяца выезда и кликаем ---
+                checkout_month_found = (
+                    await self._navigate_datepicker_to_month(
+                        page, checkout.year, checkout.month
+                    )
+                )
+                if checkout_month_found:
+                    clicked_out = await self._click_datepicker_day(
+                        page, checkout.year, checkout.month, checkout.day
+                    )
+                    if not clicked_out:
+                        logger.debug(
+                            "prices_checkout_click_failed",
+                            external_id=external_id,
+                            checkout=str(checkout),
+                            attempt=attempt,
+                        )
+                    await asyncio.sleep(0.5)
+
+                # --- Шаг 8: Проверяем появление карусели ---
+                carousel_appeared = (
+                    await self._check_nearest_dates_appeared(page)
+                )
+
+                if carousel_appeared:
+                    # Клики сработали — читаем цену
+                    price = await self._read_item_price(page)
+                    if price is not None and price > 0:
+                        day_price = price
+                    logger.debug(
+                        "prices_day_extracted",
+                        external_id=external_id,
+                        day_idx=day_idx,
+                        checkin=str(checkin),
+                        checkout=str(checkout),
+                        min_stay_used=actual_min_stay,
+                        price=day_price or base_price,
+                        attempt=attempt,
+                    )
+                    break
+
+                # Карусель не появилась — клики не сработали
+                logger.debug(
+                    "prices_nearest_dates_not_found",
+                    external_id=external_id,
+                    day_idx=day_idx,
+                    checkin=str(checkin),
+                    checkout=str(checkout),
+                    attempt=attempt,
+                    max_attempts=MAX_DATE_SELECTION_RETRIES,
+                )
+
+                await self._close_datepicker(page)
+                await asyncio.sleep(0.5)
+
+            # Записываем итоговую цену для дня
+            if day_price is not None and day_price > 0:
+                prices[day_idx] = day_price
             else:
                 prices[day_idx] = base_price
 
-            logger.debug(
-                "prices_day_extracted",
-                external_id=external_id,
-                day_idx=day_idx,
-                checkin=str(checkin),
-                checkout=str(checkout),
-                min_stay_used=actual_min_stay,
-                price=prices[day_idx],
-            )
-
-            # --- Шаг 8: Полный сброс датепикера ---
+            # --- Финальный сброс датепикера ---
             await self._close_datepicker(page)
             await asyncio.sleep(0.3)
 
@@ -617,6 +655,31 @@ class ListingService:
             external_id=external_id,
         )
         return False
+    
+    async def _check_nearest_dates_appeared(
+        self, page: Page
+    ) -> bool:
+        """Проверяет, появилась ли карусель ближайших дат.
+
+        После успешного выбора дат заезда и выезда Avito
+        отображает карусель <ul role="listbox" data-marker="nearest-dates">
+        с вариантами дат и ценами. Её появление подтверждает,
+        что JS Avito обработал клики корректно.
+
+        Args:
+            page: Активная страница Playwright.
+
+        Returns:
+            True если карусель найдена на странице.
+        """
+        try:
+            await page.wait_for_selector(
+                NEAREST_DATES_SELECTOR,
+                timeout=NEAREST_DATES_TIMEOUT,
+            )
+            return True
+        except Exception:
+            return False
 
     async def _navigate_datepicker_to_month(
         self,
@@ -671,6 +734,13 @@ class ListingService:
     ) -> bool:
         """Кликает на доступный день в видимом месяце датепикера.
 
+        Кликает на элемент с role="button" и
+        data-marker="datepicker/content" — родительский контейнер
+        кликабельной ячейки дня. Именно этот элемент обрабатывает
+        события клика в React-приложении Avito. Клик на вложенный
+        <div data-marker="datepicker-day-available"> не вызывает
+        обработчик бронирования, т.к. Avito проверяет event.target.
+
         Args:
             target_year: Год.
             target_month: Месяц (1-12).
@@ -681,6 +751,9 @@ class ListingService:
         """
         target_month_0 = target_month - 1
 
+        # Ищем родительский div[role="button"][data-marker="datepicker/content"],
+        # внутри которого есть div[data-marker="datepicker-day-available"]
+        # с текстом, совпадающим с нужным днём.
         el_handle = await page.evaluate_handle(
             f"""() => {{
                 const cal = document.querySelector(
@@ -688,16 +761,16 @@ class ListingService:
                     + '({target_year}-{target_month_0})"]'
                 );
                 if (!cal) return null;
-                const dayContents = cal.querySelectorAll(
+                const contentCells = cal.querySelectorAll(
                     '[data-marker="datepicker/content"]'
                 );
-                for (const dayEl of dayContents) {{
-                    const inner = dayEl.querySelector(
+                for (const cell of contentCells) {{
+                    const dayLabel = cell.querySelector(
                         '[data-marker="datepicker-day-available"]'
                     );
-                    if (!inner) continue;
-                    if (parseInt(inner.textContent.trim()) === {target_day}) {{
-                        return inner;
+                    if (!dayLabel) continue;
+                    if (parseInt(dayLabel.textContent.trim()) === {target_day}) {{
+                        return cell;
                     }}
                 }}
                 return null;
@@ -1547,20 +1620,31 @@ class ListingService:
                     return None
                 await asyncio.sleep(0.5)
 
-            free_day_elements = await page.query_selector_all(
+            # Кликаем на родительский div[data-marker="datepicker/content"],
+            # содержащий доступный день, чтобы Avito JS корректно обработал
+            free_content_cells = await page.query_selector_all(
                 "[data-marker='datepicker'] "
-                "[data-marker='datepicker-day-available']"
+                "[data-marker='datepicker/content']:not([data-disabled='true'])"
             )
 
-            if not free_day_elements:
+            # Фильтруем только те, которые содержат доступный день
+            clickable_cells: list = []
+            for cell in free_content_cells:
+                has_available = await cell.query_selector(
+                    "[data-marker='datepicker-day-available']"
+                )
+                if has_available:
+                    clickable_cells.append(cell)
+
+            if not clickable_cells:
                 return None
 
-            total_free = len(free_day_elements)
+            total_free = len(clickable_cells)
             actual_index = min(day_index, total_free - 1)
-            day_el = free_day_elements[actual_index]
+            cell_el = clickable_cells[actual_index]
 
             try:
-                await day_el.click()
+                await cell_el.click()
             except Exception:
                 await self._close_datepicker(page)
                 await asyncio.sleep(0.5)
