@@ -38,7 +38,7 @@ from src.services import BrowserService, ExportService, ListingService
 # Прямая ссылка на объявление Avito (без дублирования)
 DIRECT_LISTING_URL: str = (
     "https://www.avito.ru/sankt-peterburg/kvartiry/"
-    "kvartira-studiya_28_m_1_krovat_2171665897"
+    "kvartira-studiya_264_m_2_krovati_2612385579"
 )
 
 # Пути к тестовым файлам (отдельно от основных)
