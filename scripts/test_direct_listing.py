@@ -21,12 +21,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from playwright.async_api import Page
 
 from src.config import (
-    BrowserSettings,
+    ConfigValidationError,
     ExportSettings,
-    ProxySettings,
     get_logger,
-    setup_logging,
+    load_settings,
     set_trace_id,
+    setup_logging,
 )
 from src.repositories import SQLiteListingRepository
 from src.services import BrowserService, ExportService, ListingService
@@ -195,13 +195,22 @@ async def run_direct_pipeline() -> None:
     """Запускает конвейер парсинга одного объявления по прямой ссылке.
 
     Этапы:
-    1. Запускает браузер и переходит на страницу объявления.
-    2. Извлекает базовую цену и название со страницы.
-    3. Извлекает все детальные данные через ListingService
+    1. Загружает настройки из .env (включая прокси).
+    2. Запускает браузер и переходит на страницу объявления.
+    3. Извлекает базовую цену и название со страницы.
+    4. Извлекает все детальные данные через ListingService
        (координаты, календарь, цены через датепикер, мин. срок).
-    4. Сохраняет в тестовую БД SQLite.
-    5. Экспортирует в тестовый Excel-файл.
+    5. Сохраняет в тестовую БД SQLite.
+    6. Экспортирует в тестовый Excel-файл.
     """
+    # --- Загружаем настройки из .env ---
+    try:
+        settings = load_settings()
+    except ConfigValidationError as e:
+        print(f"\n[ОШИБКА КОНФИГУРАЦИИ]\n{e}")
+        print("\nПроверьте файл .env (см. .env.example для справки).")
+        return
+
     # --- Извлекаем ID и название из URL ---
     try:
         external_id = _extract_avito_id_from_url(DIRECT_LISTING_URL)
@@ -216,27 +225,17 @@ async def run_direct_pipeline() -> None:
     print(f"  URL:         {DIRECT_LISTING_URL}")
     print(f"  External ID: {external_id}")
     print(f"  Название:    {approx_title} (приблизительно из URL)")
+    print(f"  Прокси:      {'включены (' + settings.proxy.proxy_file_path + ')' if settings.proxy.proxy_file_path else 'отключены'}")
     print(f"{'=' * 60}\n")
 
     # --- Подготовка инфраструктуры ---
-    browser_settings = BrowserSettings(
-        headless=True,
-        navigation_timeout=90000,
-        page_wait_time=30000,
-    )
-
-    # Тестовый скрипт работает без прокси
-    proxy_settings = ProxySettings(
-        proxy_file_path="",
-        rotate_every_n=0,
-    )
-
+    # Настройки браузера и прокси берём из .env через load_settings()
     repository = SQLiteListingRepository(db_path=TEST_DB_PATH)
     repository.initialize()
 
     browser_service = BrowserService(
-        settings=browser_settings,
-        proxy_settings=proxy_settings,
+        settings=settings.browser,
+        proxy_settings=settings.proxy,
     )
 
     try:
@@ -245,6 +244,7 @@ async def run_direct_pipeline() -> None:
             "direct_test_started",
             url=DIRECT_LISTING_URL,
             external_id=external_id,
+            proxy_enabled=bool(settings.proxy.proxy_file_path),
         )
         print("[этап 1] Запуск браузера и навигация на объявление...")
 
@@ -294,9 +294,6 @@ async def run_direct_pipeline() -> None:
             print(f"  Название:     {approx_title} (из URL)")
 
         # === ЭТАП 3: Полный парсинг карточки через ListingService ===
-        # ListingService.parse_listing() выполняет всё:
-        # координаты, календарь, мин. срок, цены через датепикер,
-        # рейтинг хоста, мгновенное бронирование.
         print(
             "\n[этап 3] Парсинг карточки объявления "
             "(ListingService — координаты, календарь, цены)..."
