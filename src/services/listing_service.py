@@ -49,6 +49,10 @@ LISTING_UNBLOCK_WAIT: int = 15
 # (защита от бесконечного цикла ротации)
 MAX_PROXY_ROTATIONS_PER_LISTING: int = 3
 
+# Минимальный срок аренды по умолчанию, если не удалось прочитать
+# из датепикера (выбранная дата + 1 день = 2 суток)
+DEFAULT_MIN_STAY_FALLBACK: int = 2
+
 # Маппинг текстовых описаний категорий на enum
 ROOM_CATEGORY_MAP: dict[str, RoomCategory] = {
     "комната": RoomCategory.ROOM,
@@ -365,27 +369,31 @@ class ListingService:
     ) -> list[int]:
         """Извлекает реальные цены для каждого свободного дня.
 
-        Для каждого свободного дня (calendar_60[i] == 0):
-        1. Открывает датепикер заново (чистое состояние).
-        2. Нажимает кнопку «Сбросить» для гарантированного
-           сброса ранее выбранных дат.
-        3. Листает до месяца даты заезда.
-        4. Кликает на дату заезда (check-in).
-        5. Читает мин. срок из текста датепикера.
-        6. Вычисляет дату выезда = заезд + мин. срок.
-        7. Листает до месяца выезда, кликает дату выезда.
-        8. Проверяет появление карусели nearest-dates —
-           если нет, повторяет весь цикл (до 3 попыток).
-        9. Читает цену из элемента цены на странице.
-        10. Полностью сбрасывает и закрывает датепикер.
+        Обходит дни последовательно (0..59). Для каждого свободного
+        дня, который ещё не был обработан:
+        1. Открывает датепикер, сбрасывает состояние.
+        2. Листает до месяца заезда, кликает дату заезда.
+        3. Читает мин. срок из текста датепикера.
+        4. Вычисляет дату выезда = заезд + мин. срок.
+        5. Листает до месяца выезда, кликает дату выезда.
+        6. Проверяет карусель nearest-dates → читает цену.
+        7. «Разблокирует» следующие (мин. срок − 1) дней:
+           если день был занят (calendar_60[j] == 1) — меняет
+           на 0 (свободен), назначает ту же цену и добавляет
+           в множество обработанных (пропустится при обходе).
+           Если день уже был свободен — не трогает его,
+           он будет обработан отдельно со своей ценой.
 
-        Занятые дни получают цену 0.
+        Занятые дни, не разблокированные мин. сроком, получают
+        цену 0.
 
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
             calendar_60: Массив занятости (0 — свободен, 1 — занят).
-            min_stay: Фоллбэк мин. срока аренды.
+                         Мутируется: разблокированные дни меняются
+                         с 1 на 0.
+            min_stay: Фоллбэк мин. срока аренды из календаря.
             base_price: Цена-фоллбэк при ошибке чтения.
 
         Returns:
@@ -394,12 +402,16 @@ class ListingService:
         today = date.today()
         prices: list[int] = [0] * CALENDAR_DAYS_TARGET
 
-        free_days = [
-            i for i in range(len(calendar_60))
-            if calendar_60[i] == 0
-        ]
+        # Множество индексов дней, которые уже обработаны
+        # (разблокированы через мин. срок предыдущего свободного дня).
+        # Эти дни пропускаются при обходе — их цена уже назначена.
+        processed_by_min_stay: set[int] = set()
 
-        if not free_days:
+        initial_free_count = sum(
+            1 for i in range(len(calendar_60)) if calendar_60[i] == 0
+        )
+
+        if initial_free_count == 0:
             logger.info(
                 "prices_no_free_days",
                 external_id=external_id,
@@ -409,13 +421,23 @@ class ListingService:
         logger.info(
             "prices_extraction_started",
             external_id=external_id,
-            free_days=len(free_days),
+            free_days=initial_free_count,
             total_days=len(calendar_60),
         )
 
-        for day_idx in free_days:
+        for day_idx in range(CALENDAR_DAYS_TARGET):
+            # Пропускаем занятые дни (не разблокированные)
+            if calendar_60[day_idx] == 1:
+                continue
+
+            # Пропускаем дни, уже обработанные через мин. срок
+            # предыдущего свободного дня (были заняты → разблокированы)
+            if day_idx in processed_by_min_stay:
+                continue
+
             checkin = today + timedelta(days=day_idx)
             day_price: int | None = None
+            actual_min_stay: int = DEFAULT_MIN_STAY_FALLBACK
 
             for attempt in range(1, MAX_DATE_SELECTION_RETRIES + 1):
                 # --- Шаг 1: Закрываем датепикер если открыт ---
@@ -476,7 +498,7 @@ class ListingService:
                 # --- Шаг 6: Читаем мин. срок из текста датепикера ---
                 actual_min_stay = (
                     await self._read_min_stay_from_datepicker(
-                        page, min_stay
+                        page, DEFAULT_MIN_STAY_FALLBACK
                     )
                 )
                 checkout = checkin + timedelta(days=actual_min_stay)
@@ -536,21 +558,59 @@ class ListingService:
                 await self._close_datepicker(page)
                 await asyncio.sleep(0.5)
 
-            # Записываем итоговую цену для дня
-            if day_price is not None and day_price > 0:
-                prices[day_idx] = day_price
-            else:
-                prices[day_idx] = base_price
+            # Записываем итоговую цену для текущего дня
+            resolved_price = (
+                day_price if day_price is not None and day_price > 0
+                else base_price
+            )
+            prices[day_idx] = resolved_price
+
+            # === Разблокировка дней по минимальному сроку ===
+            # Следующие (actual_min_stay - 1) дней после текущего:
+            # — если день был занят (1) → разблокируем (ставим 0),
+            #   назначаем ту же цену, добавляем в processed_by_min_stay.
+            # — если день уже свободен (0) → не трогаем,
+            #   он будет обработан отдельно со своей ценой.
+            for offset in range(1, actual_min_stay + 1):
+                unlock_idx = day_idx + offset
+                if unlock_idx >= CALENDAR_DAYS_TARGET:
+                    break
+
+                if calendar_60[unlock_idx] == 1:
+                    # День был занят → разблокируем
+                    calendar_60[unlock_idx] = 0
+                    prices[unlock_idx] = resolved_price
+                    processed_by_min_stay.add(unlock_idx)
+
+                    logger.debug(
+                        "day_unlocked_by_min_stay",
+                        external_id=external_id,
+                        source_day_idx=day_idx,
+                        unlocked_day_idx=unlock_idx,
+                        min_stay=actual_min_stay,
+                        assigned_price=resolved_price,
+                    )
 
             # --- Финальный сброс датепикера ---
             await self._close_datepicker(page)
             await asyncio.sleep(0.3)
 
-        filled = sum(1 for i in free_days if prices[i] > 0)
+        # Итоговая статистика
+        final_free_count = sum(
+            1 for i in range(len(calendar_60)) if calendar_60[i] == 0
+        )
+        unlocked_count = len(processed_by_min_stay)
+        filled = sum(
+            1 for i in range(CALENDAR_DAYS_TARGET)
+            if calendar_60[i] == 0 and prices[i] > 0
+        )
+
         logger.info(
             "prices_extraction_completed",
             external_id=external_id,
-            free_days=len(free_days),
+            initial_free_days=initial_free_count,
+            unlocked_days=unlocked_count,
+            final_free_days=final_free_count,
             prices_filled=filled,
         )
 
@@ -655,7 +715,7 @@ class ListingService:
             external_id=external_id,
         )
         return False
-    
+
     async def _check_nearest_dates_appeared(
         self, page: Page
     ) -> bool:
