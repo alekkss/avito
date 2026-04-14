@@ -220,7 +220,7 @@ async def run_direct_pipeline() -> None:
 
     # --- Подготовка инфраструктуры ---
     browser_settings = BrowserSettings(
-        headless=False,
+        headless=True,
         navigation_timeout=90000,
         page_wait_time=30000,
     )
