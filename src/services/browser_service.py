@@ -114,6 +114,23 @@ BROWSER_ARGS: list[str] = [
 MAX_CLOUDFLARE_RETRIES: int = 3
 CLOUDFLARE_WAIT_SECONDS: int = 15
 
+# Ключевые фразы сетевых ошибок прокси — при их обнаружении
+# в тексте исключения навигации прокси считается нерабочим
+PROXY_ERROR_MARKERS: tuple[str, ...] = (
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_PROXY_AUTH_FAILED",
+    "ERR_SOCKS_CONNECTION_FAILED",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_CONNECTION_TIMED_OUT",
+    "ERR_CONNECTION_CLOSED",
+    "PROXY_CONNECTION_FAILED",
+)
+
+# Максимальное количество смен прокси при навигации на каталог
+MAX_PROXY_RETRIES_ON_NAVIGATE: int = 10
+
 
 @dataclass
 class ProxyInfo:
@@ -201,6 +218,22 @@ def _load_proxies_from_file(file_path: str) -> list[ProxyInfo]:
     )
 
     return proxies
+
+
+def _is_proxy_error(error_text: str) -> bool:
+    """Проверяет, является ли ошибка навигации проблемой прокси.
+
+    Анализирует текст исключения на наличие характерных
+    маркеров сетевых ошибок прокси-соединения.
+
+    Args:
+        error_text: Текст ошибки (str(exception)).
+
+    Returns:
+        True если ошибка вызвана нерабочим прокси.
+    """
+    error_upper = error_text.upper()
+    return any(marker in error_upper for marker in PROXY_ERROR_MARKERS)
 
 
 class BrowserService:
@@ -568,6 +601,10 @@ class BrowserService:
         перед переходом, ожидание CloudFlare challenge с повторными
         проверками, валидация загрузки контента Avito.
 
+        При ошибке прокси-соединения (ERR_TUNNEL_CONNECTION_FAILED и др.)
+        автоматически переключается на следующий прокси из пула и
+        повторяет навигацию — до MAX_PROXY_RETRIES_ON_NAVIGATE попыток.
+
         Args:
             url: URL для перехода.
 
@@ -578,11 +615,116 @@ class BrowserService:
             logger.error("navigate_no_page", url=url)
             return False
 
+        # Первая попытка навигации
+        result = await self._try_navigate(url)
+        if result is True:
+            return True
+
+        # result is False — обычная ошибка (блокировка, CloudFlare и т.д.)
+        # result is None — ошибка прокси, нужна ротация
+        if result is not None:
+            return False
+
+        # === Ошибка прокси → автоматический перебор ===
+        if not self._proxies:
+            logger.error(
+                "proxy_error_no_proxies_to_retry",
+                url=url[:200],
+            )
+            return False
+
+        max_retries = min(
+            MAX_PROXY_RETRIES_ON_NAVIGATE, len(self._proxies)
+        )
+
+        for retry in range(1, max_retries + 1):
+            logger.warning(
+                "proxy_error_rotating",
+                url=url[:200],
+                retry=retry,
+                max_retries=max_retries,
+            )
+            print(
+                f"  [прокси] Прокси не работает. "
+                f"Переключение на следующий "
+                f"({retry}/{max_retries})..."
+            )
+
+            try:
+                await self.rotate_proxy()
+            except RuntimeError as e:
+                logger.error(
+                    "proxy_rotation_failed_during_navigate",
+                    retry=retry,
+                    error=str(e),
+                )
+                continue
+
+            result = await self._try_navigate(url)
+            if result is True:
+                logger.info(
+                    "navigation_success_after_proxy_retry",
+                    url=url[:200],
+                    retry=retry,
+                )
+                print(
+                    f"  [прокси] Прокси #{self._current_proxy_index} "
+                    f"работает! Навигация успешна."
+                )
+                return True
+
+            # result is False — страница загрузилась, но заблокирована
+            if result is not None:
+                logger.warning(
+                    "navigation_blocked_after_proxy_retry",
+                    url=url[:200],
+                    retry=retry,
+                )
+                return False
+
+            # result is None — снова ошибка прокси, пробуем следующий
+            logger.debug(
+                "proxy_still_failing",
+                retry=retry,
+                proxy_index=self._current_proxy_index,
+            )
+
+        logger.error(
+            "all_proxy_retries_exhausted_on_navigate",
+            url=url[:200],
+            max_retries=max_retries,
+        )
+        print(
+            f"  [прокси] Все попытки смены прокси исчерпаны "
+            f"({max_retries} шт.). Навигация не удалась."
+        )
+        return False
+
+    async def _try_navigate(self, url: str) -> bool | None:
+        """Выполняет одну попытку навигации по URL.
+
+        Разделяет результат на три случая:
+        - True: страница загружена и доступна.
+        - False: страница загрузилась, но заблокирована или
+          CloudFlare не пройден (прокси работает, проблема в другом).
+        - None: ошибка прокси-соединения (прокси мёртв,
+          нужна ротация).
+
+        Args:
+            url: URL для перехода.
+
+        Returns:
+            True — успех, False — блокировка, None — ошибка прокси.
+        """
+        if self._page is None:
+            logger.error("try_navigate_no_page", url=url[:200])
+            return False
+
         try:
             delay = random.uniform(2, 4)
             logger.info(
                 "navigation_started",
-                url=url,
+                url=url[:200],
                 delay=round(delay, 1),
             )
             await asyncio.sleep(delay)
@@ -596,56 +738,67 @@ class BrowserService:
             # Ожидание загрузки контента после первоначальной загрузки DOM
             await asyncio.sleep(8)
 
-            # Проверяем CloudFlare challenge с повторными попытками
-            for attempt in range(1, MAX_CLOUDFLARE_RETRIES + 1):
-                status = await self._check_page_status()
+        except Exception as e:
+            error_text = str(e)
 
-                if status == "ok":
-                    logger.info(
-                        "navigation_success",
-                        url=url,
-                        current_url=self._page.url,
-                    )
-                    return True
+            # Определяем: это ошибка прокси или что-то другое?
+            if _is_proxy_error(error_text):
+                logger.warning(
+                    "navigation_proxy_error",
+                    url=url[:200],
+                    error=error_text[:300],
+                    proxy_index=self._current_proxy_index,
+                )
+                return None
 
-                if status == "blocked":
-                    logger.warning("page_blocked", url=url)
-                    return False
+            logger.error(
+                "navigation_failed",
+                url=url[:200],
+                error=error_text[:300],
+            )
+            return False
 
-                if status == "cloudflare":
-                    logger.info(
-                        "cloudflare_challenge_waiting",
-                        attempt=attempt,
-                        max_attempts=MAX_CLOUDFLARE_RETRIES,
-                        wait_seconds=CLOUDFLARE_WAIT_SECONDS,
-                    )
-                    await asyncio.sleep(CLOUDFLARE_WAIT_SECONDS)
+        # Проверяем CloudFlare challenge с повторными попытками
+        for attempt in range(1, MAX_CLOUDFLARE_RETRIES + 1):
+            status = await self._check_page_status()
 
-            # Если после всех попыток CloudFlare не прошёл —
-            # проверяем, может контент всё же загрузился
-            final_status = await self._check_page_status()
-            if final_status == "ok":
+            if status == "ok":
                 logger.info(
-                    "navigation_success_after_retries",
-                    url=url,
+                    "navigation_success",
+                    url=url[:200],
+                    current_url=self._page.url[:200],
                 )
                 return True
 
-            logger.warning(
-                "cloudflare_challenge_failed",
-                url=url,
-                attempts=MAX_CLOUDFLARE_RETRIES,
-            )
-            return False
+            if status == "blocked":
+                logger.warning("page_blocked", url=url[:200])
+                return False
 
-        except Exception as e:
-            logger.error(
-                "navigation_failed",
-                exc_info=True,
-                url=url,
-                error=str(e),
+            if status == "cloudflare":
+                logger.info(
+                    "cloudflare_challenge_waiting",
+                    attempt=attempt,
+                    max_attempts=MAX_CLOUDFLARE_RETRIES,
+                    wait_seconds=CLOUDFLARE_WAIT_SECONDS,
+                )
+                await asyncio.sleep(CLOUDFLARE_WAIT_SECONDS)
+
+        # Если после всех попыток CloudFlare не прошёл —
+        # проверяем, может контент всё же загрузился
+        final_status = await self._check_page_status()
+        if final_status == "ok":
+            logger.info(
+                "navigation_success_after_retries",
+                url=url[:200],
             )
-            return False
+            return True
+
+        logger.warning(
+            "cloudflare_challenge_failed",
+            url=url[:200],
+            attempts=MAX_CLOUDFLARE_RETRIES,
+        )
+        return False
 
     async def _check_page_status(self) -> str:
         """Определяет текущий статус загруженной страницы.
