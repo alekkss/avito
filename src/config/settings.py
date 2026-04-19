@@ -96,7 +96,7 @@ class LogSettings:
 
 @dataclass(frozen=True)
 class ProxySettings:
-    """Настройки ротации прокси.
+    """Настройки ротации прокси и параллельной обработки.
 
     Attributes:
         proxy_file_path: Путь к файлу со списком прокси
@@ -104,10 +104,16 @@ class ProxySettings:
         rotate_every_n: Менять прокси каждые N обработанных карточек.
             0 — автоматическая ротация по счётчику отключена
             (ротация только при бане).
+        max_workers: Максимальное количество параллельных браузерных
+            сессий для обработки карточек объявлений. Каждый воркер
+            использует свой прокси и имитирует отдельного пользователя.
+            0 — автоопределение (равно количеству прокси, но не более 5).
+            Если прокси не загружены — всегда 1 воркер.
     """
 
     proxy_file_path: str
     rotate_every_n: int
+    max_workers: int
 
 
 @dataclass(frozen=True)
@@ -122,7 +128,7 @@ class Settings:
         database: Настройки базы данных.
         export: Настройки экспорта.
         log: Настройки логирования.
-        proxy: Настройки ротации прокси.
+        proxy: Настройки ротации прокси и параллельной обработки.
     """
 
     browser: BrowserSettings
@@ -362,6 +368,7 @@ def load_settings() -> Settings:
     # --- Прокси ---
     proxy_file_path_raw = os.getenv("PROXY_FILE_PATH", "")
     rotate_every_n_raw = os.getenv("ROTATE_EVERY_N_LISTINGS", "70")
+    max_workers_raw = os.getenv("MAX_WORKERS", "0")
 
     try:
         proxy_file_path = _validate_proxy_file(proxy_file_path_raw)
@@ -377,6 +384,15 @@ def load_settings() -> Settings:
     except ConfigValidationError as e:
         errors.append(str(e))
         rotate_every_n = 70
+
+    try:
+        max_workers = _validate_non_negative_int(
+            _parse_int(max_workers_raw, "MAX_WORKERS"),
+            "MAX_WORKERS",
+        )
+    except ConfigValidationError as e:
+        errors.append(str(e))
+        max_workers = 0
 
     # --- Если есть ошибки — выбрасываем все разом ---
     if errors:
@@ -408,5 +424,6 @@ def load_settings() -> Settings:
         proxy=ProxySettings(
             proxy_file_path=proxy_file_path,
             rotate_every_n=rotate_every_n,
+            max_workers=max_workers,
         ),
     )

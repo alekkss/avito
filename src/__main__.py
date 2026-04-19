@@ -2,8 +2,8 @@
 
 Связывает все компоненты системы и запускает полный цикл:
 1. Загрузка конфигурации и инициализация логирования.
-2. Парсинг объявлений аренды из каталога Avito.
-3. Детальный парсинг карточек (координаты, календарь, цены).
+2. Парсинг объявлений аренды из каталога Avito (последовательно).
+3. Параллельный парсинг карточек (N воркеров с разными прокси).
 4. Экспорт результатов в Excel для анализа.
 
 Запуск: python -m src
@@ -23,10 +23,13 @@ from src.config import (
 from src.repositories import SQLiteListingRepository
 from src.services import (
     BrowserService,
+    CatalogItemForWorker,
     ExportService,
     ListingService,
+    ParallelListingService,
     ScraperService,
 )
+from src.services.scraper_service import CatalogItem
 
 logger = get_logger("main")
 
@@ -51,11 +54,11 @@ def create_repository(settings: Settings) -> SQLiteListingRepository:
 
 
 def create_browser_service(settings: Settings) -> BrowserService:
-    """Создаёт сервис управления браузером.
+    """Создаёт сервис управления браузером для обхода каталога.
 
-    Передаёт настройки браузера и прокси. BrowserService
-    загрузит прокси из файла при запуске (launch),
-    если путь указан в proxy settings.
+    Этот BrowserService используется только на этапе каталога
+    (последовательный обход). Для параллельного парсинга карточек
+    ParallelListingService создаёт свои BrowserService-ы.
 
     Args:
         settings: Настройки приложения.
@@ -73,6 +76,10 @@ def create_listing_service(
     browser_service: BrowserService,
 ) -> ListingService:
     """Создаёт сервис парсинга карточек объявлений.
+
+    Используется только для последовательного режима (scrape_all).
+    В параллельном режиме ListingService создаётся внутри
+    ParallelListingService для каждого воркера.
 
     Args:
         browser_service: Сервис браузера.
@@ -108,6 +115,26 @@ def create_scraper_service(
     )
 
 
+def create_parallel_listing_service(
+    settings: Settings,
+    repository: SQLiteListingRepository,
+) -> ParallelListingService:
+    """Создаёт сервис параллельной обработки карточек.
+
+    Args:
+        settings: Настройки приложения.
+        repository: Репозиторий объявлений.
+
+    Returns:
+        Экземпляр ParallelListingService.
+    """
+    return ParallelListingService(
+        browser_settings=settings.browser,
+        proxy_settings=settings.proxy,
+        repository=repository,
+    )
+
+
 def create_export_service(
     repository: SQLiteListingRepository,
     settings: Settings,
@@ -127,12 +154,45 @@ def create_export_service(
     )
 
 
+def convert_catalog_items(
+    catalog_items: list[CatalogItem],
+) -> list[CatalogItemForWorker]:
+    """Конвертирует CatalogItem из ScraperService в CatalogItemForWorker.
+
+    ScraperService возвращает CatalogItem (свой внутренний формат).
+    ParallelListingService принимает CatalogItemForWorker (свой формат).
+    Эта функция выполняет маппинг между ними и добавляет нумерацию
+    для логирования прогресса.
+
+    Args:
+        catalog_items: Список элементов из каталога.
+
+    Returns:
+        Список элементов для параллельной обработки.
+    """
+    total = len(catalog_items)
+    return [
+        CatalogItemForWorker(
+            external_id=item.external_id,
+            url=item.url,
+            title=item.title,
+            price=item.price,
+            is_instant_book=item.is_instant_book,
+            host_rating=item.host_rating,
+            index=index,
+            total=total,
+        )
+        for index, item in enumerate(catalog_items, start=1)
+    ]
+
+
 async def run_pipeline(settings: Settings) -> None:
     """Запускает полный конвейер обработки данных.
 
-    Последовательно выполняет два этапа:
-    1. Парсинг объявлений аренды с Avito (каталог + карточки).
-    2. Экспорт результатов в Excel.
+    Последовательно выполняет три этапа:
+    1. Обход каталога Avito (последовательно, один браузер).
+    2. Параллельный парсинг карточек (N воркеров с разными прокси).
+    3. Экспорт результатов в Excel.
 
     Гарантирует корректное закрытие всех ресурсов
     через блоки try/finally.
@@ -144,13 +204,12 @@ async def run_pipeline(settings: Settings) -> None:
     browser_service = create_browser_service(settings)
 
     try:
-        # === ЭТАП 1: Парсинг ===
+        # === ЭТАП 1: Обход каталога ===
         logger.info(
             "stage_started",
-            stage="scraping",
+            stage="catalog",
             url=settings.scraper.category_url,
             proxy_enabled=bool(settings.proxy.proxy_file_path),
-            rotate_every=settings.proxy.rotate_every_n,
         )
 
         listing_service = create_listing_service(
@@ -164,17 +223,54 @@ async def run_pipeline(settings: Settings) -> None:
             settings=settings,
         )
 
-        listings = await scraper_service.scrape_all()
+        catalog_items = await scraper_service.scrape_catalog()
+
+        logger.info(
+            "stage_completed",
+            stage="catalog",
+            catalog_items=len(catalog_items),
+        )
+
+        if not catalog_items:
+            logger.warning(
+                "pipeline_stopped",
+                reason="no_catalog_items",
+            )
+            return
+
+        # Закрываем каталожный браузер — он больше не нужен,
+        # воркеры создадут свои контексты
+        await browser_service.close()
+        logger.info("catalog_browser_closed")
+
+        # === ЭТАП 2: Параллельный парсинг карточек ===
+        logger.info(
+            "stage_started",
+            stage="parallel_parsing",
+            total_items=len(catalog_items),
+            max_workers=settings.proxy.max_workers,
+            proxy_enabled=bool(settings.proxy.proxy_file_path),
+            rotate_every=settings.proxy.rotate_every_n,
+        )
+
+        worker_items = convert_catalog_items(catalog_items)
+
+        parallel_service = create_parallel_listing_service(
+            settings=settings,
+            repository=repository,
+        )
+
+        listings = await parallel_service.process_all(worker_items)
 
         listings_count = repository.get_listings_count()
         logger.info(
             "stage_completed",
-            stage="scraping",
+            stage="parallel_parsing",
             new_listings=len(listings),
             total_in_db=listings_count,
         )
 
-        # === ЭТАП 2: Экспорт в Excel ===
+        # === ЭТАП 3: Экспорт в Excel ===
         logger.info("stage_started", stage="export")
 
         export_service = create_export_service(
@@ -197,6 +293,8 @@ async def run_pipeline(settings: Settings) -> None:
             )
 
     finally:
+        # browser_service может быть уже закрыт после этапа каталога,
+        # но close() безопасен для повторного вызова
         await browser_service.close()
         repository.close()
         logger.info("all_resources_closed")
@@ -230,6 +328,7 @@ def main() -> None:
         max_pages=settings.scraper.max_pages,
         proxy_enabled=bool(settings.proxy.proxy_file_path),
         rotate_every=settings.proxy.rotate_every_n,
+        max_workers=settings.proxy.max_workers,
     )
 
     try:

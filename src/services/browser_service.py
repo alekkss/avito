@@ -3,6 +3,11 @@
 Инкапсулирует запуск браузера, создание контекста со stealth-настройками,
 имитацию человеческого поведения, ротацию прокси и управление жизненным
 циклом. Основан на шаблоне с антидетект-параметрами для обхода защиты Avito.
+
+Поддерживает два режима работы:
+- Автономный (launch): загружает прокси из файла, запускает свой Chromium.
+- Воркер (launch_for_worker): использует переданный Browser-инстанс
+  и назначенные прокси, не управляет жизненным циклом Playwright/Browser.
 """
 
 import asyncio
@@ -14,6 +19,7 @@ from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
+    Playwright,
     async_playwright,
 )
 
@@ -147,11 +153,14 @@ class ProxyInfo:
     password: str
 
 
-def _load_proxies_from_file(file_path: str) -> list[ProxyInfo]:
+def load_proxies_from_file(file_path: str) -> list[ProxyInfo]:
     """Загружает список прокси из текстового файла.
 
     Формат каждой строки: host:port:username:password.
     Пустые строки и строки, начинающиеся с #, пропускаются.
+
+    Функция вынесена на уровень модуля, чтобы ParallelListingService
+    мог загрузить прокси один раз и распределить между воркерами.
 
     Args:
         file_path: Путь к файлу с прокси.
@@ -243,50 +252,96 @@ class BrowserService:
     контекста, stealth-инъекции, ротацию прокси и имитацию поведения
     пользователя.
 
+    Поддерживает два режима:
+    - Автономный: вызов launch() создаёт свой Playwright + Browser.
+    - Воркер: вызов launch_for_worker() использует переданный Browser,
+      создаёт только свой BrowserContext. Жизненным циклом Playwright
+      и Browser управляет вызывающий код (ParallelListingService).
+
     Attributes:
         _settings: Настройки браузера из конфигурации.
         _proxy_settings: Настройки ротации прокси.
-        _playwright: Экземпляр Playwright (async context manager).
+        _playwright: Экземпляр Playwright (None в режиме воркера).
         _browser: Экземпляр запущенного браузера.
         _context: Контекст браузера с настройками.
         _page: Активная страница.
-        _proxies: Список загруженных прокси.
+        _proxies: Список загруженных/назначенных прокси.
         _current_proxy_index: Индекс текущего прокси в списке.
         _listings_since_rotation: Счётчик карточек с последней ротации.
+        _owns_browser: True если этот экземпляр управляет жизненным
+            циклом Playwright и Browser (автономный режим).
+        _worker_id: Идентификатор воркера для логирования (None если
+            автономный режим).
     """
 
     def __init__(
         self,
         settings: BrowserSettings,
         proxy_settings: ProxySettings,
+        assigned_proxies: list[ProxyInfo] | None = None,
+        worker_id: int | None = None,
     ) -> None:
         """Инициализирует сервис.
 
         Args:
             settings: Настройки браузера (headless, таймауты).
             proxy_settings: Настройки прокси (путь к файлу, порог ротации).
+            assigned_proxies: Заранее назначенные прокси для воркера.
+                Если передан — загрузка из файла пропускается.
+                Если None — прокси загружаются из файла при launch().
+            worker_id: Идентификатор воркера для логирования.
+                None — автономный режим (каталог).
         """
         self._settings = settings
         self._proxy_settings = proxy_settings
-        self._playwright: object | None = None
+        self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._assigned_proxies = assigned_proxies
         self._proxies: list[ProxyInfo] = []
         self._current_proxy_index: int = -1
         self._listings_since_rotation: int = 0
+        self._owns_browser: bool = True
+        self._worker_id = worker_id
+
+    def _log_prefix(self) -> str:
+        """Возвращает префикс для логов с идентификатором воркера.
+
+        Returns:
+            Строка вида "worker_3" или "main" для автономного режима.
+        """
+        if self._worker_id is not None:
+            return f"worker_{self._worker_id}"
+        return "main"
 
     def _load_proxies(self) -> None:
-        """Загружает прокси из файла, если путь указан в настройках.
+        """Загружает прокси из файла или использует назначенные.
 
+        Если в конструктор переданы assigned_proxies — использует их.
+        Иначе загружает из файла по пути из настроек.
         При пустом пути — парсер работает без прокси.
-        Список перемешивается для равномерного использования.
         """
-        if not self._proxy_settings.proxy_file_path:
-            logger.info("proxy_disabled_no_file")
+        # Если прокси назначены извне (режим воркера) — используем их
+        if self._assigned_proxies is not None:
+            self._proxies = list(self._assigned_proxies)
+            logger.info(
+                "proxies_assigned",
+                source=self._log_prefix(),
+                total=len(self._proxies),
+                rotate_every=self._proxy_settings.rotate_every_n,
+            )
             return
 
-        self._proxies = _load_proxies_from_file(
+        # Автономный режим — загружаем из файла
+        if not self._proxy_settings.proxy_file_path:
+            logger.info(
+                "proxy_disabled_no_file",
+                source=self._log_prefix(),
+            )
+            return
+
+        self._proxies = load_proxies_from_file(
             self._proxy_settings.proxy_file_path
         )
 
@@ -295,6 +350,7 @@ class BrowserService:
 
         logger.info(
             "proxies_ready",
+            source=self._log_prefix(),
             total=len(self._proxies),
             rotate_every=self._proxy_settings.rotate_every_n,
         )
@@ -318,6 +374,7 @@ class BrowserService:
             self._current_proxy_index = 0
             logger.info(
                 "proxy_pool_recycled",
+                source=self._log_prefix(),
                 total=len(self._proxies),
             )
 
@@ -325,6 +382,7 @@ class BrowserService:
 
         logger.info(
             "proxy_selected",
+            source=self._log_prefix(),
             index=self._current_proxy_index,
             total=len(self._proxies),
             server=proxy.server,
@@ -361,6 +419,7 @@ class BrowserService:
 
         logger.info(
             "context_creating",
+            source=self._log_prefix(),
             user_agent=selected_ua[:60],
             viewport=f"{viewport_width}x{viewport_height}",
             proxy_server=proxy.server if proxy else "без прокси",
@@ -426,7 +485,7 @@ class BrowserService:
     async def launch(self) -> Page:
         """Запускает браузер, создаёт контекст и страницу.
 
-        Полный цикл инициализации: загрузка прокси из файла,
+        Автономный режим: загрузка прокси из файла,
         запуск Chromium с антидетект-аргументами, создание контекста
         с первым прокси (или без прокси), инъекция stealth-скриптов.
 
@@ -448,6 +507,8 @@ class BrowserService:
                 args=BROWSER_ARGS,
             )
 
+            self._owns_browser = True
+
             # Берём первый прокси (или None, если прокси отключены)
             first_proxy = self._get_next_proxy()
 
@@ -463,6 +524,7 @@ class BrowserService:
 
             logger.info(
                 "browser_launched",
+                source=self._log_prefix(),
                 headless=self._settings.headless,
                 timeout=self._settings.navigation_timeout,
                 proxy_enabled=len(self._proxies) > 0,
@@ -476,12 +538,78 @@ class BrowserService:
         except Exception as e:
             logger.error(
                 "browser_launch_failed",
+                source=self._log_prefix(),
                 exc_info=True,
                 error=str(e),
             )
             await self.close()
             raise RuntimeError(
                 f"Не удалось запустить браузер: {e}"
+            ) from e
+
+    async def launch_for_worker(self, browser: Browser) -> Page:
+        """Создаёт контекст и страницу на переданном Browser-инстансе.
+
+        Режим воркера: не запускает свой Playwright/Browser, а использует
+        переданный. Жизненным циклом Browser управляет вызывающий код
+        (ParallelListingService). При close() закрывает только свой
+        контекст, не трогая Browser.
+
+        Прокси берутся из assigned_proxies, переданных в конструктор.
+
+        Args:
+            browser: Уже запущенный Playwright Browser (общий для всех
+                воркеров — экономия памяти, один процесс Chromium).
+
+        Returns:
+            Готовая к использованию страница Playwright.
+
+        Raises:
+            RuntimeError: Если не удалось создать контекст.
+        """
+        try:
+            self._browser = browser
+            self._owns_browser = False
+
+            # Загружаем назначенные прокси (без чтения файла)
+            self._load_proxies()
+
+            # Берём первый прокси из назначенного пула
+            first_proxy = self._get_next_proxy()
+
+            self._context = await self._create_context(
+                proxy=first_proxy,
+            )
+
+            self._page = await self._context.new_page()
+            await self._page.add_init_script(STEALTH_SCRIPT)
+
+            # Сбрасываем счётчик карточек
+            self._listings_since_rotation = 0
+
+            logger.info(
+                "worker_context_launched",
+                source=self._log_prefix(),
+                proxy_enabled=len(self._proxies) > 0,
+                proxy_count=len(self._proxies),
+                proxy_server=(
+                    first_proxy.server if first_proxy else "нет"
+                ),
+            )
+
+            return self._page
+
+        except Exception as e:
+            logger.error(
+                "worker_context_launch_failed",
+                source=self._log_prefix(),
+                exc_info=True,
+                error=str(e),
+            )
+            await self.close()
+            raise RuntimeError(
+                f"Не удалось создать контекст воркера "
+                f"{self._log_prefix()}: {e}"
             ) from e
 
     async def rotate_proxy(self) -> Page:
@@ -518,6 +646,7 @@ class BrowserService:
             except Exception as e:
                 logger.warning(
                     "context_close_error_during_rotation",
+                    source=self._log_prefix(),
                     error=str(e),
                 )
             self._context = None
@@ -537,6 +666,7 @@ class BrowserService:
 
         logger.info(
             "proxy_rotated",
+            source=self._log_prefix(),
             old_index=old_proxy_index,
             new_index=self._current_proxy_index,
             new_server=next_proxy.server if next_proxy else "нет",
@@ -547,6 +677,7 @@ class BrowserService:
         pause = random.uniform(3.0, 6.0)
         logger.debug(
             "post_rotation_pause",
+            source=self._log_prefix(),
             pause=round(pause, 1),
         )
         await asyncio.sleep(pause)
@@ -578,6 +709,7 @@ class BrowserService:
 
         logger.info(
             "rotation_threshold_reached",
+            source=self._log_prefix(),
             listings_count=self._listings_since_rotation,
             threshold=self._proxy_settings.rotate_every_n,
         )
@@ -612,7 +744,11 @@ class BrowserService:
             True если страница загружена успешно и без блокировки.
         """
         if self._page is None:
-            logger.error("navigate_no_page", url=url)
+            logger.error(
+                "navigate_no_page",
+                source=self._log_prefix(),
+                url=url,
+            )
             return False
 
         # Первая попытка навигации
@@ -629,6 +765,7 @@ class BrowserService:
         if not self._proxies:
             logger.error(
                 "proxy_error_no_proxies_to_retry",
+                source=self._log_prefix(),
                 url=url[:200],
             )
             return False
@@ -640,12 +777,13 @@ class BrowserService:
         for retry in range(1, max_retries + 1):
             logger.warning(
                 "proxy_error_rotating",
+                source=self._log_prefix(),
                 url=url[:200],
                 retry=retry,
                 max_retries=max_retries,
             )
             print(
-                f"  [прокси] Прокси не работает. "
+                f"  [{self._log_prefix()}][прокси] Прокси не работает. "
                 f"Переключение на следующий "
                 f"({retry}/{max_retries})..."
             )
@@ -655,6 +793,7 @@ class BrowserService:
             except RuntimeError as e:
                 logger.error(
                     "proxy_rotation_failed_during_navigate",
+                    source=self._log_prefix(),
                     retry=retry,
                     error=str(e),
                 )
@@ -664,11 +803,13 @@ class BrowserService:
             if result is True:
                 logger.info(
                     "navigation_success_after_proxy_retry",
+                    source=self._log_prefix(),
                     url=url[:200],
                     retry=retry,
                 )
                 print(
-                    f"  [прокси] Прокси #{self._current_proxy_index} "
+                    f"  [{self._log_prefix()}][прокси] "
+                    f"Прокси #{self._current_proxy_index} "
                     f"работает! Навигация успешна."
                 )
                 return True
@@ -677,6 +818,7 @@ class BrowserService:
             if result is not None:
                 logger.warning(
                     "navigation_blocked_after_proxy_retry",
+                    source=self._log_prefix(),
                     url=url[:200],
                     retry=retry,
                 )
@@ -685,17 +827,20 @@ class BrowserService:
             # result is None — снова ошибка прокси, пробуем следующий
             logger.debug(
                 "proxy_still_failing",
+                source=self._log_prefix(),
                 retry=retry,
                 proxy_index=self._current_proxy_index,
             )
 
         logger.error(
             "all_proxy_retries_exhausted_on_navigate",
+            source=self._log_prefix(),
             url=url[:200],
             max_retries=max_retries,
         )
         print(
-            f"  [прокси] Все попытки смены прокси исчерпаны "
+            f"  [{self._log_prefix()}][прокси] "
+            f"Все попытки смены прокси исчерпаны "
             f"({max_retries} шт.). Навигация не удалась."
         )
         return False
@@ -717,13 +862,18 @@ class BrowserService:
             True — успех, False — блокировка, None — ошибка прокси.
         """
         if self._page is None:
-            logger.error("try_navigate_no_page", url=url[:200])
+            logger.error(
+                "try_navigate_no_page",
+                source=self._log_prefix(),
+                url=url[:200],
+            )
             return False
 
         try:
             delay = random.uniform(2, 4)
             logger.info(
                 "navigation_started",
+                source=self._log_prefix(),
                 url=url[:200],
                 delay=round(delay, 1),
             )
@@ -745,6 +895,7 @@ class BrowserService:
             if _is_proxy_error(error_text):
                 logger.warning(
                     "navigation_proxy_error",
+                    source=self._log_prefix(),
                     url=url[:200],
                     error=error_text[:300],
                     proxy_index=self._current_proxy_index,
@@ -753,6 +904,7 @@ class BrowserService:
 
             logger.error(
                 "navigation_failed",
+                source=self._log_prefix(),
                 url=url[:200],
                 error=error_text[:300],
             )
@@ -765,18 +917,24 @@ class BrowserService:
             if status == "ok":
                 logger.info(
                     "navigation_success",
+                    source=self._log_prefix(),
                     url=url[:200],
                     current_url=self._page.url[:200],
                 )
                 return True
 
             if status == "blocked":
-                logger.warning("page_blocked", url=url[:200])
+                logger.warning(
+                    "page_blocked",
+                    source=self._log_prefix(),
+                    url=url[:200],
+                )
                 return False
 
             if status == "cloudflare":
                 logger.info(
                     "cloudflare_challenge_waiting",
+                    source=self._log_prefix(),
                     attempt=attempt,
                     max_attempts=MAX_CLOUDFLARE_RETRIES,
                     wait_seconds=CLOUDFLARE_WAIT_SECONDS,
@@ -789,12 +947,14 @@ class BrowserService:
         if final_status == "ok":
             logger.info(
                 "navigation_success_after_retries",
+                source=self._log_prefix(),
                 url=url[:200],
             )
             return True
 
         logger.warning(
             "cloudflare_challenge_failed",
+            source=self._log_prefix(),
             url=url[:200],
             attempts=MAX_CLOUDFLARE_RETRIES,
         )
@@ -822,6 +982,7 @@ class BrowserService:
 
             logger.debug(
                 "page_status_check",
+                source=self._log_prefix(),
                 title=title[:80],
                 url=current_url[:100],
             )
@@ -863,6 +1024,7 @@ class BrowserService:
                 if element is not None:
                     logger.debug(
                         "avito_content_found",
+                        source=self._log_prefix(),
                         selector=selector,
                     )
                     return "ok"
@@ -872,6 +1034,7 @@ class BrowserService:
             if "avito" in title.lower() or "авито" in title.lower():
                 logger.debug(
                     "avito_title_found",
+                    source=self._log_prefix(),
                     title=title[:80],
                 )
                 return "ok"
@@ -883,6 +1046,7 @@ class BrowserService:
         except Exception as e:
             logger.warning(
                 "page_status_check_failed",
+                source=self._log_prefix(),
                 error=str(e),
             )
             return "unknown"
@@ -927,11 +1091,15 @@ class BrowserService:
             await self._page.evaluate("window.scrollTo(0, 0)")
             await asyncio.sleep(1)
 
-            logger.debug("human_behavior_simulated")
+            logger.debug(
+                "human_behavior_simulated",
+                source=self._log_prefix(),
+            )
 
         except Exception as e:
             logger.warning(
                 "human_behavior_simulation_failed",
+                source=self._log_prefix(),
                 error=str(e),
             )
 
@@ -946,7 +1114,11 @@ class BrowserService:
             return
 
         wait_ms = milliseconds or self._settings.page_wait_time
-        logger.debug("page_wait_started", wait_ms=wait_ms)
+        logger.debug(
+            "page_wait_started",
+            source=self._log_prefix(),
+            wait_ms=wait_ms,
+        )
         await self._page.wait_for_timeout(wait_ms)
 
     @property
@@ -959,29 +1131,43 @@ class BrowserService:
         return self._page
 
     async def close(self) -> None:
-        """Закрывает браузер и освобождает все ресурсы.
+        """Закрывает контекст и (в автономном режиме) браузер.
 
-        Безопасно закрывает контекст, браузер и Playwright
-        в правильном порядке, подавляя ошибки при закрытии.
+        В режиме воркера закрывает только свой BrowserContext,
+        не трогая Browser и Playwright — их жизненным циклом
+        управляет ParallelListingService.
+
+        В автономном режиме закрывает всё: контекст, браузер,
+        Playwright.
         """
         try:
             if self._context is not None:
                 await self._context.close()
                 self._context = None
 
-            if self._browser is not None:
-                await self._browser.close()
+            # В режиме воркера не закрываем Browser и Playwright
+            if self._owns_browser:
+                if self._browser is not None:
+                    await self._browser.close()
+                    self._browser = None
+
+                if self._playwright is not None:
+                    await self._playwright.stop()  # type: ignore[union-attr]
+                    self._playwright = None
+            else:
+                # Воркер: просто обнуляем ссылку, не закрываем
                 self._browser = None
 
-            if self._playwright is not None:
-                await self._playwright.stop()  # type: ignore[union-attr]
-                self._playwright = None
-
             self._page = None
-            logger.info("browser_closed")
+            logger.info(
+                "browser_closed",
+                source=self._log_prefix(),
+                owned=self._owns_browser,
+            )
 
         except Exception as e:
             logger.warning(
                 "browser_close_error",
+                source=self._log_prefix(),
                 error=str(e),
             )

@@ -1,0 +1,658 @@
+"""Сервис параллельной обработки карточек объявлений.
+
+Оркестрирует N параллельных воркеров, каждый из которых использует
+собственный BrowserContext с уникальным прокси, User-Agent и viewport.
+Карточки распределяются через asyncio.Queue — воркер, освободившийся
+первым, берёт следующую карточку (балансировка нагрузки).
+
+Паттерн Strategy: ParallelListingService заменяет последовательный
+обход карточек в ScraperService._parse_all_listings() на параллельный,
+не меняя логику парсинга отдельной карточки (ListingService).
+"""
+
+import asyncio
+import random
+from dataclasses import dataclass
+
+from playwright.async_api import Browser, Playwright, async_playwright
+
+from src.config import BrowserSettings, ProxySettings, get_logger
+from src.models import RawListing
+from src.repositories.sqlite_repository import SQLiteListingRepository
+from src.services.browser_service import (
+    BROWSER_ARGS,
+    BrowserService,
+    ProxyInfo,
+    load_proxies_from_file,
+)
+from src.services.listing_service import ListingService
+
+logger = get_logger("parallel_listing_service")
+
+# Максимальное количество воркеров при автоопределении
+MAX_AUTO_WORKERS: int = 5
+
+# URL для «прогрева» нового контекста воркера
+WARMUP_URL: str = "https://www.avito.ru"
+
+# Минимальная пауза между стартом воркеров (секунды),
+# чтобы не создавать одновременную нагрузку
+WORKER_STAGGER_DELAY_MIN: float = 2.0
+WORKER_STAGGER_DELAY_MAX: float = 5.0
+
+# Пауза между обработкой карточек внутри воркера (секунды),
+# имитирует человеческий ритм просмотра объявлений
+WORKER_INTER_CARD_DELAY_MIN: float = 1.0
+WORKER_INTER_CARD_DELAY_MAX: float = 3.0
+
+
+@dataclass
+class CatalogItemForWorker:
+    """Элемент очереди для воркера.
+
+    Содержит все данные, необходимые ListingService.parse_listing()
+    для обработки одной карточки объявления.
+
+    Attributes:
+        external_id: ID объявления (формат "av_<id>").
+        url: Относительная или абсолютная ссылка на объявление.
+        title: Название объявления из каталога.
+        price: Базовая цена из каталога (руб./сут.).
+        is_instant_book: Флаг мгновенного бронирования из каталога.
+        host_rating: Рейтинг хоста из каталога.
+        index: Порядковый номер карточки (для логирования прогресса).
+        total: Общее количество карточек (для логирования прогресса).
+    """
+
+    external_id: str
+    url: str
+    title: str
+    price: int
+    is_instant_book: bool
+    host_rating: float
+    index: int
+    total: int
+
+
+@dataclass
+class WorkerResult:
+    """Результат работы одного воркера.
+
+    Attributes:
+        worker_id: Идентификатор воркера.
+        successful: Количество успешно обработанных карточек.
+        failed: Количество карточек с ошибками.
+    """
+
+    worker_id: int
+    successful: int
+    failed: int
+
+
+def _determine_worker_count(
+    proxy_settings: ProxySettings,
+    proxy_count: int,
+    total_items: int,
+) -> int:
+    """Определяет оптимальное количество воркеров.
+
+    Логика:
+    - Если прокси нет — всегда 1 воркер (последовательная обработка).
+    - Если max_workers задан явно (> 0) — используется он,
+      но не более количества прокси и не более количества карточек.
+    - Если max_workers = 0 (авто) — равно количеству прокси,
+      но не более MAX_AUTO_WORKERS и не более количества карточек.
+
+    Args:
+        proxy_settings: Настройки прокси из конфигурации.
+        proxy_count: Количество загруженных прокси.
+        total_items: Общее количество карточек для обработки.
+
+    Returns:
+        Оптимальное количество воркеров (минимум 1).
+    """
+    if proxy_count == 0:
+        return 1
+
+    if total_items == 0:
+        return 1
+
+    if proxy_settings.max_workers > 0:
+        # Явно задано пользователем
+        count = proxy_settings.max_workers
+    else:
+        # Автоопределение
+        count = min(proxy_count, MAX_AUTO_WORKERS)
+
+    # Не больше прокси (каждому воркеру нужен хотя бы 1 прокси)
+    count = min(count, proxy_count)
+
+    # Не больше карточек (нет смысла в пустых воркерах)
+    count = min(count, total_items)
+
+    # Минимум 1
+    return max(count, 1)
+
+
+def _distribute_proxies(
+    all_proxies: list[ProxyInfo],
+    worker_count: int,
+) -> list[list[ProxyInfo]]:
+    """Распределяет прокси между воркерами.
+
+    Каждый воркер получает свой набор прокси для ротации.
+    Распределение выполняется round-robin: первый прокси
+    первому воркеру, второй — второму, и так далее по кругу.
+    Это гарантирует, что воркеры стартуют с разных IP.
+
+    Args:
+        all_proxies: Полный список прокси.
+        worker_count: Количество воркеров.
+
+    Returns:
+        Список из worker_count списков ProxyInfo.
+    """
+    distribution: list[list[ProxyInfo]] = [
+        [] for _ in range(worker_count)
+    ]
+
+    for i, proxy in enumerate(all_proxies):
+        worker_idx = i % worker_count
+        distribution[worker_idx].append(proxy)
+
+    for worker_idx, proxies in enumerate(distribution):
+        logger.debug(
+            "proxies_distributed",
+            worker_id=worker_idx,
+            proxy_count=len(proxies),
+            servers=[p.server for p in proxies],
+        )
+
+    return distribution
+
+
+class ParallelListingService:
+    """Сервис параллельной обработки карточек объявлений.
+
+    Создаёт один процесс Chromium и N BrowserContext-ов (воркеров),
+    каждый со своим прокси. Карточки распределяются через
+    asyncio.Queue — воркер, освободившийся первым, берёт следующую.
+
+    При отсутствии прокси или max_workers=1 — работает в один
+    поток, полностью совместим с текущим поведением.
+
+    Attributes:
+        _browser_settings: Настройки браузера.
+        _proxy_settings: Настройки прокси и параллелизации.
+        _repository: Репозиторий для сохранения результатов.
+    """
+
+    def __init__(
+        self,
+        browser_settings: BrowserSettings,
+        proxy_settings: ProxySettings,
+        repository: SQLiteListingRepository,
+    ) -> None:
+        """Инициализирует сервис параллельной обработки.
+
+        Args:
+            browser_settings: Настройки браузера (headless, таймауты).
+            proxy_settings: Настройки прокси (файл, ротация, воркеры).
+            repository: Репозиторий для сохранения объявлений.
+        """
+        self._browser_settings = browser_settings
+        self._proxy_settings = proxy_settings
+        self._repository = repository
+
+    async def process_all(
+        self,
+        catalog_items: list[CatalogItemForWorker],
+    ) -> list[RawListing]:
+        """Обрабатывает все карточки объявлений параллельно.
+
+        Основной публичный метод. Загружает прокси, определяет
+        количество воркеров, запускает общий Chromium, создаёт
+        воркеров и ожидает завершения всех.
+
+        Args:
+            catalog_items: Список карточек из каталога для обработки.
+
+        Returns:
+            Список успешно спарсенных объявлений.
+        """
+        if not catalog_items:
+            logger.info("parallel_processing_skipped_no_items")
+            return []
+
+        # --- Загружаем прокси ---
+        all_proxies = self._load_all_proxies()
+
+        # --- Определяем количество воркеров ---
+        worker_count = _determine_worker_count(
+            self._proxy_settings,
+            len(all_proxies),
+            len(catalog_items),
+        )
+
+        logger.info(
+            "parallel_processing_started",
+            total_items=len(catalog_items),
+            worker_count=worker_count,
+            proxy_count=len(all_proxies),
+            max_workers_setting=self._proxy_settings.max_workers,
+        )
+        print(
+            f"\n  [параллелизация] Запуск {worker_count} воркер(ов) "
+            f"для обработки {len(catalog_items)} карточек"
+        )
+
+        # --- Распределяем прокси между воркерами ---
+        proxy_distribution = _distribute_proxies(
+            all_proxies, worker_count
+        )
+
+        # --- Наполняем очередь ---
+        queue: asyncio.Queue[CatalogItemForWorker | None] = asyncio.Queue()
+        for item in catalog_items:
+            await queue.put(item)
+
+        # Отравляющие пилюли: по одной на каждого воркера
+        for _ in range(worker_count):
+            await queue.put(None)
+
+        # --- Запускаем общий Chromium ---
+        playwright: Playwright | None = None
+        browser: Browser | None = None
+        all_listings: list[RawListing] = []
+        worker_browser_services: list[BrowserService] = []
+
+        try:
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(
+                headless=self._browser_settings.headless,
+                args=BROWSER_ARGS,
+            )
+
+            logger.info(
+                "shared_browser_launched",
+                headless=self._browser_settings.headless,
+                worker_count=worker_count,
+            )
+
+            # --- Создаём и запускаем воркеров ---
+            results_lock = asyncio.Lock()
+            tasks: list[asyncio.Task[WorkerResult]] = []
+
+            for worker_id in range(worker_count):
+                worker_proxies = proxy_distribution[worker_id]
+
+                # Создаём отдельный BrowserService для воркера
+                worker_browser_service = BrowserService(
+                    settings=self._browser_settings,
+                    proxy_settings=self._proxy_settings,
+                    assigned_proxies=worker_proxies,
+                    worker_id=worker_id,
+                )
+                worker_browser_services.append(worker_browser_service)
+
+                # Создаём ListingService для воркера
+                worker_listing_service = ListingService(
+                    browser_service=worker_browser_service,
+                )
+
+                task = asyncio.create_task(
+                    self._run_worker(
+                        worker_id=worker_id,
+                        browser=browser,
+                        browser_service=worker_browser_service,
+                        listing_service=worker_listing_service,
+                        queue=queue,
+                        all_listings=all_listings,
+                        results_lock=results_lock,
+                    ),
+                    name=f"worker_{worker_id}",
+                )
+                tasks.append(task)
+
+                # Стаггеринг: пауза между запуском воркеров,
+                # чтобы не создавать одновременные соединения
+                if worker_id < worker_count - 1:
+                    stagger = random.uniform(
+                        WORKER_STAGGER_DELAY_MIN,
+                        WORKER_STAGGER_DELAY_MAX,
+                    )
+                    logger.debug(
+                        "worker_stagger_delay",
+                        next_worker_id=worker_id + 1,
+                        delay=round(stagger, 1),
+                    )
+                    await asyncio.sleep(stagger)
+
+            # --- Ожидаем завершения всех воркеров ---
+            worker_results = await asyncio.gather(
+                *tasks, return_exceptions=True
+            )
+
+            # --- Собираем статистику ---
+            total_successful = 0
+            total_failed = 0
+
+            for i, result in enumerate(worker_results):
+                if isinstance(result, Exception):
+                    logger.error(
+                        "worker_crashed",
+                        worker_id=i,
+                        error=str(result),
+                        error_type=type(result).__name__,
+                    )
+                    print(
+                        f"  [воркер {i}] Аварийное завершение: {result}"
+                    )
+                elif isinstance(result, WorkerResult):
+                    total_successful += result.successful
+                    total_failed += result.failed
+                    logger.info(
+                        "worker_finished",
+                        worker_id=result.worker_id,
+                        successful=result.successful,
+                        failed=result.failed,
+                    )
+
+            logger.info(
+                "parallel_processing_completed",
+                total_items=len(catalog_items),
+                total_successful=total_successful,
+                total_failed=total_failed,
+                worker_count=worker_count,
+            )
+            print(
+                f"\n  [параллелизация] Завершено: "
+                f"{total_successful} успешно, "
+                f"{total_failed} с ошибками "
+                f"(из {len(catalog_items)} карточек)"
+            )
+
+        finally:
+            # --- Закрываем все воркерные контексты ---
+            for ws in worker_browser_services:
+                try:
+                    await ws.close()
+                except Exception as e:
+                    logger.warning(
+                        "worker_browser_close_error",
+                        error=str(e),
+                    )
+
+            # --- Закрываем общий браузер ---
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception as e:
+                    logger.warning(
+                        "shared_browser_close_error",
+                        error=str(e),
+                    )
+
+            if playwright is not None:
+                try:
+                    await playwright.stop()
+                except Exception as e:
+                    logger.warning(
+                        "playwright_close_error",
+                        error=str(e),
+                    )
+
+            logger.info("parallel_resources_closed")
+
+        return all_listings
+
+    async def _run_worker(
+        self,
+        worker_id: int,
+        browser: Browser,
+        browser_service: BrowserService,
+        listing_service: ListingService,
+        queue: asyncio.Queue[CatalogItemForWorker | None],
+        all_listings: list[RawListing],
+        results_lock: asyncio.Lock,
+    ) -> WorkerResult:
+        """Цикл работы одного воркера.
+
+        Инициализирует свой BrowserContext, прогревает его,
+        затем в цикле берёт карточки из очереди и парсит.
+        Завершается при получении None (отравляющая пилюля).
+
+        Args:
+            worker_id: Идентификатор воркера.
+            browser: Общий Browser-инстанс.
+            browser_service: BrowserService воркера.
+            listing_service: ListingService воркера.
+            queue: Очередь карточек для обработки.
+            all_listings: Общий список результатов (потокобезопасный
+                через results_lock).
+            results_lock: Лок для безопасного добавления в all_listings.
+
+        Returns:
+            Статистика работы воркера.
+        """
+        successful = 0
+        failed = 0
+        prefix = f"worker_{worker_id}"
+
+        try:
+            # --- Инициализация контекста ---
+            page = await browser_service.launch_for_worker(browser)
+
+            logger.info(
+                "worker_started",
+                worker_id=worker_id,
+                proxy_count=len(browser_service._proxies),
+            )
+
+            # --- Прогрев: заходим на главную Avito ---
+            await self._warmup_worker(browser_service, page, worker_id)
+
+            # --- Основной цикл обработки карточек ---
+            while True:
+                item = await queue.get()
+
+                # Отравляющая пилюля — завершаем воркер
+                if item is None:
+                    queue.task_done()
+                    break
+
+                logger.info(
+                    "worker_processing_card",
+                    worker_id=worker_id,
+                    progress=f"{item.index}/{item.total}",
+                    external_id=item.external_id,
+                    title=item.title[:50],
+                )
+                print(
+                    f"  [{prefix}] Карточка {item.index}/{item.total}: "
+                    f"{item.external_id}"
+                )
+
+                try:
+                    # Используем актуальную page из browser_service
+                    current_page = browser_service.page or page
+
+                    listing = await listing_service.parse_listing(
+                        page=current_page,
+                        external_id=item.external_id,
+                        url=item.url,
+                        title=item.title,
+                        base_price=item.price,
+                        is_instant_book=item.is_instant_book,
+                        catalog_host_rating=item.host_rating,
+                    )
+
+                    if listing is not None:
+                        # Сохраняем в БД (потокобезопасно)
+                        await self._repository.save_listing_async(listing)
+
+                        # Добавляем в общий список результатов
+                        async with results_lock:
+                            all_listings.append(listing)
+
+                        successful += 1
+                        logger.info(
+                            "worker_card_saved",
+                            worker_id=worker_id,
+                            progress=f"{item.index}/{item.total}",
+                            external_id=listing.external_id,
+                            room_category=listing.room_category.value,
+                            avg_price=round(listing.average_price),
+                        )
+                    else:
+                        failed += 1
+                        logger.warning(
+                            "worker_card_parse_failed",
+                            worker_id=worker_id,
+                            progress=f"{item.index}/{item.total}",
+                            external_id=item.external_id,
+                        )
+
+                except Exception as e:
+                    failed += 1
+                    logger.error(
+                        "worker_card_error",
+                        worker_id=worker_id,
+                        external_id=item.external_id,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+                finally:
+                    queue.task_done()
+
+                # Обновляем page после возможной ротации внутри
+                # listing_service
+                if browser_service.page is not None:
+                    page = browser_service.page
+
+                # Проверяем плановую ротацию прокси по счётчику
+                new_page = (
+                    await browser_service.increment_and_check_rotation()
+                )
+                if new_page is not None:
+                    page = new_page
+                    logger.info(
+                        "worker_proxy_rotated_by_counter",
+                        worker_id=worker_id,
+                        successful=successful,
+                        failed=failed,
+                    )
+                    print(
+                        f"  [{prefix}] Плановая смена прокси "
+                        f"(обработано {successful + failed} карточек)"
+                    )
+                    # Прогрев после ротации
+                    await self._warmup_worker(
+                        browser_service, page, worker_id
+                    )
+
+                # Пауза между карточками — имитация человека
+                delay = random.uniform(
+                    WORKER_INTER_CARD_DELAY_MIN,
+                    WORKER_INTER_CARD_DELAY_MAX,
+                )
+                await asyncio.sleep(delay)
+
+        except Exception as e:
+            logger.error(
+                "worker_fatal_error",
+                worker_id=worker_id,
+                error=str(e),
+                error_type=type(e).__name__,
+                successful=successful,
+                failed=failed,
+            )
+            print(
+                f"  [{prefix}] Критическая ошибка: {e}"
+            )
+
+        logger.info(
+            "worker_completed",
+            worker_id=worker_id,
+            successful=successful,
+            failed=failed,
+        )
+        print(
+            f"  [{prefix}] Завершён: {successful} успешно, "
+            f"{failed} с ошибками"
+        )
+
+        return WorkerResult(
+            worker_id=worker_id,
+            successful=successful,
+            failed=failed,
+        )
+
+    async def _warmup_worker(
+        self,
+        browser_service: BrowserService,
+        page: object,
+        worker_id: int,
+    ) -> None:
+        """Прогревает контекст воркера.
+
+        Заходит на главную Avito, чтобы получить cookies
+        и выглядеть как обычный пользователь. Снижает
+        вероятность бана на первой карточке.
+
+        Args:
+            browser_service: BrowserService воркера.
+            page: Страница воркера (не используется напрямую,
+                навигация идёт через browser_service).
+            worker_id: ID воркера для логирования.
+        """
+        try:
+            logger.info(
+                "worker_warmup_started",
+                worker_id=worker_id,
+                url=WARMUP_URL,
+            )
+
+            success = await browser_service.navigate(WARMUP_URL)
+            if success:
+                await browser_service.simulate_human_behavior()
+                logger.info(
+                    "worker_warmup_completed",
+                    worker_id=worker_id,
+                )
+            else:
+                logger.warning(
+                    "worker_warmup_failed",
+                    worker_id=worker_id,
+                )
+
+        except Exception as e:
+            logger.warning(
+                "worker_warmup_error",
+                worker_id=worker_id,
+                error=str(e),
+            )
+
+    def _load_all_proxies(self) -> list[ProxyInfo]:
+        """Загружает полный пул прокси из файла.
+
+        Returns:
+            Список всех прокси. Пустой список если путь не указан.
+        """
+        if not self._proxy_settings.proxy_file_path:
+            logger.info("parallel_no_proxies_configured")
+            return []
+
+        try:
+            proxies = load_proxies_from_file(
+                self._proxy_settings.proxy_file_path
+            )
+            # Перемешиваем для равномерного распределения
+            random.shuffle(proxies)
+            return proxies
+        except RuntimeError as e:
+            logger.error(
+                "parallel_proxy_load_failed",
+                error=str(e),
+            )
+            return []

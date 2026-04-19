@@ -4,6 +4,11 @@
 используя CSS-селекторы на основе data-marker атрибутов.
 Поддерживает обход пагинации с retry-логикой, обнаружение
 циклов и детальный парсинг карточек через ListingService.
+
+Публичный интерфейс:
+- scrape_catalog() — обход каталога, возврат списка CatalogItem.
+- scrape_all() — полный цикл: каталог + последовательный парсинг
+  карточек (для обратной совместимости и тестов).
 """
 
 import asyncio
@@ -97,6 +102,11 @@ class ScraperService:
     базовые данные из каталога и запускает детальный парсинг
     карточек через ListingService. Поддерживает пагинацию,
     обнаружение циклов, ротацию прокси и батчевое сохранение.
+
+    Публичный интерфейс:
+    - scrape_catalog(): обход каталога → список CatalogItem.
+    - scrape_all(): полный цикл (каталог + карточки) для обратной
+      совместимости и тестовых скриптов.
 
     Attributes:
         _browser_service: Сервис управления браузером.
@@ -488,11 +498,18 @@ class ScraperService:
                 error=str(e),
             )
 
-    async def scrape_all(self) -> list[RawListing]:
-        """Парсит все страницы каталога и карточки объявлений.
+    async def scrape_catalog(self) -> list[CatalogItem]:
+        """Обходит каталог Avito и возвращает список базовых данных.
+
+        Публичный метод для использования в __main__.py.
+        Выполняет полный цикл: запуск браузера, навигация,
+        обход пагинации, сбор CatalogItem.
+
+        Браузер НЕ закрывается после завершения — это позволяет
+        вызывающему коду переиспользовать его или закрыть вручную.
 
         Returns:
-            Полный список спарсенных объявлений аренды.
+            Список CatalogItem с базовыми данными из каталога.
         """
         self._seen_avito_ids.clear()
         self._total_pages = 0
@@ -513,9 +530,8 @@ class ScraperService:
         self._capture_base_url(page.url)
         self._total_pages = await self._detect_total_pages(page)
 
-        # === ЭТАП 1: Обход каталога — сбор базовых данных ===
         logger.info("catalog_scraping_started")
-        all_catalog_items = await self._scrape_catalog(page)
+        all_catalog_items = await self._collect_catalog_pages(page)
 
         if not all_catalog_items:
             logger.warning("no_catalog_items_found")
@@ -526,7 +542,32 @@ class ScraperService:
             total_items=len(all_catalog_items),
         )
 
-        # === ЭТАП 2: Детальный парсинг карточек ===
+        return all_catalog_items
+
+    async def scrape_all(self) -> list[RawListing]:
+        """Парсит все страницы каталога и карточки объявлений.
+
+        Полный цикл для обратной совместимости: каталог +
+        последовательный парсинг карточек. Используется
+        в тестовом скрипте test_single_listing.py.
+
+        Для параллельной обработки используйте scrape_catalog()
+        + ParallelListingService.process_all() в __main__.py.
+
+        Returns:
+            Полный список спарсенных объявлений аренды.
+        """
+        all_catalog_items = await self.scrape_catalog()
+
+        if not all_catalog_items:
+            return []
+
+        page = self._browser_service.page
+        if page is None:
+            logger.error("no_active_page_after_catalog")
+            return []
+
+        # === Детальный парсинг карточек (последовательный) ===
         logger.info(
             "detail_parsing_started",
             total_items=len(all_catalog_items),
@@ -543,7 +584,9 @@ class ScraperService:
 
         return all_listings
 
-    async def _scrape_catalog(self, page: Page) -> list[CatalogItem]:
+    async def _collect_catalog_pages(
+        self, page: Page
+    ) -> list[CatalogItem]:
         """Обходит все страницы каталога и собирает базовые данные.
 
         Args:

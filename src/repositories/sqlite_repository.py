@@ -3,8 +3,13 @@
 Хранит объявления краткосрочной аренды в таблице SQLite.
 Поддерживает upsert-логику (вставка или обновление по external_id),
 батчевое сохранение и сериализацию массивов/словарей в JSON.
+
+Потокобезопасность: все операции записи защищены asyncio.Lock
+для корректной работы при параллельной обработке карточек
+несколькими воркерами.
 """
 
+import asyncio
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -26,9 +31,14 @@ class SQLiteListingRepository(BaseListingRepository):
     (price_60_days, calendar_60_days) и словари (события,
     analytics_payload) сериализуются в JSON-строки.
 
+    Все операции записи защищены asyncio.Lock, что позволяет
+    безопасно вызывать save_listing() из нескольких asyncio-задач
+    одновременно (параллельные воркеры парсинга карточек).
+
     Attributes:
         _db_path: Путь к файлу базы данных.
         _connection: Активное соединение с SQLite.
+        _write_lock: Asyncio-лок для сериализации операций записи.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -39,11 +49,14 @@ class SQLiteListingRepository(BaseListingRepository):
         """
         self._db_path = db_path
         self._connection: sqlite3.Connection | None = None
+        self._write_lock: asyncio.Lock = asyncio.Lock()
 
     def _get_connection(self) -> sqlite3.Connection:
         """Возвращает активное соединение с базой данных.
 
         Если соединение ещё не создано — создаёт его.
+        SQLite настраивается с увеличенным busy_timeout (30 секунд)
+        для устойчивости при конкурентном доступе.
 
         Returns:
             Активное соединение SQLite.
@@ -56,10 +69,14 @@ class SQLiteListingRepository(BaseListingRepository):
                 db_dir = Path(self._db_path).parent
                 db_dir.mkdir(parents=True, exist_ok=True)
 
-                self._connection = sqlite3.connect(self._db_path)
+                self._connection = sqlite3.connect(
+                    self._db_path,
+                    timeout=30.0,
+                )
                 self._connection.row_factory = sqlite3.Row
                 self._connection.execute("PRAGMA journal_mode=WAL")
                 self._connection.execute("PRAGMA foreign_keys=ON")
+                self._connection.execute("PRAGMA busy_timeout=30000")
 
                 logger.info(
                     "database_connected",
@@ -292,15 +309,16 @@ class SQLiteListingRepository(BaseListingRepository):
             listing.title,
         )
 
-    def save_listing(self, listing: RawListing) -> None:
-        """Сохраняет одно объявление (upsert по external_id).
+    def _upsert_sql(self) -> str:
+        """Возвращает SQL-запрос для upsert объявления.
 
-        Args:
-            listing: Объявление аренды для сохранения.
+        Вынесен в отдельный метод для устранения дублирования
+        между save_listing() и save_listings().
+
+        Returns:
+            SQL-строка INSERT ... ON CONFLICT DO UPDATE.
         """
-        conn = self._get_connection()
-
-        sql = """
+        return """
         INSERT INTO listings
             (external_id, latitude, longitude, room_category,
              price_60_days, calendar_60_days, snapshot_timestamp,
@@ -327,8 +345,37 @@ class SQLiteListingRepository(BaseListingRepository):
             title = excluded.title
         """
 
+    async def save_listing_async(self, listing: RawListing) -> None:
+        """Сохраняет одно объявление с asyncio-блокировкой.
+
+        Потокобезопасная версия save_listing() для использования
+        из параллельных asyncio-задач (воркеров). Asyncio.Lock
+        гарантирует, что только одна корутина одновременно
+        выполняет запись в SQLite.
+
+        Args:
+            listing: Объявление аренды для сохранения.
+        """
+        async with self._write_lock:
+            self.save_listing(listing)
+
+    def save_listing(self, listing: RawListing) -> None:
+        """Сохраняет одно объявление (upsert по external_id).
+
+        Для вызова из параллельных asyncio-задач используйте
+        save_listing_async() — он оборачивает этот метод
+        в asyncio.Lock.
+
+        Args:
+            listing: Объявление аренды для сохранения.
+        """
+        conn = self._get_connection()
+
         try:
-            conn.execute(sql, self._listing_to_params(listing))
+            conn.execute(
+                self._upsert_sql(),
+                self._listing_to_params(listing),
+            )
             conn.commit()
 
             logger.debug(
@@ -356,37 +403,10 @@ class SQLiteListingRepository(BaseListingRepository):
 
         conn = self._get_connection()
 
-        sql = """
-        INSERT INTO listings
-            (external_id, latitude, longitude, room_category,
-             price_60_days, calendar_60_days, snapshot_timestamp,
-             last_host_update, min_stay, is_instant_book, host_rating,
-             price_change_event, booking_block_event, cancellation_event,
-             analytics_payload, url, title)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(external_id) DO UPDATE SET
-            latitude = excluded.latitude,
-            longitude = excluded.longitude,
-            room_category = excluded.room_category,
-            price_60_days = excluded.price_60_days,
-            calendar_60_days = excluded.calendar_60_days,
-            snapshot_timestamp = excluded.snapshot_timestamp,
-            last_host_update = excluded.last_host_update,
-            min_stay = excluded.min_stay,
-            is_instant_book = excluded.is_instant_book,
-            host_rating = excluded.host_rating,
-            price_change_event = excluded.price_change_event,
-            booking_block_event = excluded.booking_block_event,
-            cancellation_event = excluded.cancellation_event,
-            analytics_payload = excluded.analytics_payload,
-            url = excluded.url,
-            title = excluded.title
-        """
-
         rows = [self._listing_to_params(listing) for listing in listings]
 
         try:
-            conn.executemany(sql, rows)
+            conn.executemany(self._upsert_sql(), rows)
             conn.commit()
 
             logger.info(
