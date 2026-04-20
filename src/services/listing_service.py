@@ -53,6 +53,12 @@ MAX_PROXY_ROTATIONS_PER_LISTING: int = 3
 # из датепикера (выбранная дата + 1 день = 2 суток)
 DEFAULT_MIN_STAY_FALLBACK: int = 2
 
+# Количество попыток перезагрузки страницы при отсутствии календаря
+MAX_CALENDAR_RELOAD_RETRIES: int = 3
+
+# Ожидание перед перезагрузкой страницы при отсутствии календаря (секунды)
+CALENDAR_RELOAD_WAIT_SECONDS: int = 10
+
 # Маппинг текстовых описаний категорий на enum
 ROOM_CATEGORY_MAP: dict[str, RoomCategory] = {
     "комната": RoomCategory.ROOM,
@@ -294,7 +300,7 @@ class ListingService:
             current_page, external_id
         )
         calendar_data = await self._extract_calendar_data(
-            current_page, external_id
+            current_page, external_id, full_url
         )
         room_category = await self._extract_room_category(
             current_page, title
@@ -1260,13 +1266,17 @@ class ListingService:
     # ==================================================================
 
     async def _extract_calendar_data(
-        self, page: Page, external_id: str
+        self, page: Page, external_id: str, full_url: str
     ) -> dict:
         """Извлекает календарь занятости из datepicker на странице.
+
+        Если datepicker не подгрузился — ожидает 10 секунд,
+        перезагружает страницу и пробует снова (до 3 попыток).
 
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
+            full_url: Полный URL карточки для перезагрузки страницы.
 
         Returns:
             Словарь с ключами: prices, calendar, minStay.
@@ -1280,10 +1290,19 @@ class ListingService:
         datepicker_opened = await self._open_datepicker(
             page, external_id
         )
+
+        # Если datepicker не подгрузился — перезагружаем страницу
+        # и пробуем снова (до MAX_CALENDAR_RELOAD_RETRIES попыток)
+        if not datepicker_opened:
+            datepicker_opened = await self._retry_open_datepicker(
+                page, external_id, full_url
+            )
+
         if not datepicker_opened:
             logger.warning(
-                "datepicker_not_opened",
+                "datepicker_not_opened_after_all_retries",
                 external_id=external_id,
+                max_retries=MAX_CALENDAR_RELOAD_RETRIES,
             )
             return result
 
@@ -1365,6 +1384,126 @@ class ListingService:
         await self._close_datepicker(page)
 
         return result
+
+    async def _retry_open_datepicker(
+        self,
+        page: Page,
+        external_id: str,
+        full_url: str,
+    ) -> bool:
+        """Перезагружает страницу и повторно пытается открыть datepicker.
+
+        Выполняет до MAX_CALENDAR_RELOAD_RETRIES попыток:
+        ожидание CALENDAR_RELOAD_WAIT_SECONDS секунд →
+        перезагрузка страницы → попытка открыть datepicker.
+
+        Args:
+            page: Активная страница Playwright.
+            external_id: ID объявления для логирования.
+            full_url: Полный URL карточки для перезагрузки.
+
+        Returns:
+            True если datepicker удалось открыть после перезагрузки.
+        """
+        for attempt in range(1, MAX_CALENDAR_RELOAD_RETRIES + 1):
+            logger.warning(
+                "calendar_not_loaded_retrying",
+                external_id=external_id,
+                attempt=attempt,
+                max_attempts=MAX_CALENDAR_RELOAD_RETRIES,
+                wait_seconds=CALENDAR_RELOAD_WAIT_SECONDS,
+            )
+            print(
+                f"  [календарь] Календарь не подгрузился для "
+                f"{external_id}. Попытка {attempt}/"
+                f"{MAX_CALENDAR_RELOAD_RETRIES}: ожидание "
+                f"{CALENDAR_RELOAD_WAIT_SECONDS} сек, "
+                f"затем перезагрузка..."
+            )
+
+            await asyncio.sleep(CALENDAR_RELOAD_WAIT_SECONDS)
+
+            try:
+                await page.reload(
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                await asyncio.sleep(random.uniform(3.0, 5.0))
+
+                logger.info(
+                    "page_reloaded_for_calendar",
+                    external_id=external_id,
+                    attempt=attempt,
+                )
+            except Exception as e:
+                logger.warning(
+                    "page_reload_failed_for_calendar",
+                    external_id=external_id,
+                    attempt=attempt,
+                    error=str(e),
+                )
+                print(
+                    f"  [календарь] Ошибка перезагрузки страницы: {e}"
+                )
+                continue
+
+            # Проверяем, не заблокирована ли страница после reload
+            is_blocked = await self._browser_service._check_blocked()
+            if is_blocked:
+                logger.warning(
+                    "page_blocked_after_reload_for_calendar",
+                    external_id=external_id,
+                    attempt=attempt,
+                )
+                print(
+                    f"  [календарь] Страница заблокирована после "
+                    f"перезагрузки (попытка {attempt}/"
+                    f"{MAX_CALENDAR_RELOAD_RETRIES})"
+                )
+                continue
+
+            # Пробуем открыть datepicker заново
+            datepicker_opened = await self._open_datepicker(
+                page, external_id
+            )
+            if datepicker_opened:
+                logger.info(
+                    "datepicker_opened_after_reload",
+                    external_id=external_id,
+                    attempt=attempt,
+                )
+                print(
+                    f"  [календарь] Календарь подгрузился после "
+                    f"перезагрузки (попытка {attempt})!"
+                )
+                return True
+
+            logger.warning(
+                "datepicker_still_not_loaded_after_reload",
+                external_id=external_id,
+                attempt=attempt,
+            )
+            print(
+                f"  [календарь] Календарь по-прежнему не найден "
+                f"(попытка {attempt}/{MAX_CALENDAR_RELOAD_RETRIES})"
+            )
+
+        logger.error(
+            "datepicker_not_loaded_all_reloads_exhausted",
+            external_id=external_id,
+            max_retries=MAX_CALENDAR_RELOAD_RETRIES,
+            total_wait_seconds=(
+                MAX_CALENDAR_RELOAD_RETRIES
+                * CALENDAR_RELOAD_WAIT_SECONDS
+            ),
+        )
+        print(
+            f"  [календарь] Не удалось загрузить календарь для "
+            f"{external_id} после "
+            f"{MAX_CALENDAR_RELOAD_RETRIES} перезагрузок "
+            f"({MAX_CALENDAR_RELOAD_RETRIES * CALENDAR_RELOAD_WAIT_SECONDS} сек)"
+        )
+        return False
 
     # ==================================================================
     # Datepicker: открытие, парсинг дней, листание, закрытие
