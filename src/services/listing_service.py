@@ -252,6 +252,11 @@ class ListingService:
         данные, затем проходит по каждому свободному дню и через
         датепикер получает реальную цену за сутки.
 
+        Если календарь (datepicker) не удалось загрузить после
+        всех попыток перезагрузки — все 60 дней помечаются как
+        занятые, цены заполняются нулями, этап извлечения цен
+        пропускается.
+
         Args:
             page: Активная страница Playwright.
             external_id: Идентификатор объявления (формат "av_<id>").
@@ -317,19 +322,39 @@ class ListingService:
                 current_page, external_id
             )
 
-        calendar_60 = self._pad_array(
-            calendar_data.get("calendar", []), 60, 0
-        )
-        min_stay = calendar_data.get("minStay", 1)
+        # Проверяем, удалось ли извлечь календарь.
+        # Если calendar пустой — datepicker так и не загрузился:
+        # помечаем все 60 дней как занятые, цены = 0,
+        # пропускаем этап извлечения цен.
+        raw_calendar = calendar_data.get("calendar", [])
+        calendar_failed = len(raw_calendar) == 0
 
-        # === Извлечение реальных цен через датепикер ===
-        prices_60 = await self._extract_prices_for_free_days(
-            current_page,
-            external_id,
-            calendar_60,
-            min_stay,
-            base_price,
-        )
+        if calendar_failed:
+            logger.warning(
+                "calendar_empty_skipping_prices",
+                external_id=external_id,
+                reason="datepicker не загрузился после всех попыток",
+            )
+            print(
+                f"  [календарь] {external_id}: календарь не получен — "
+                f"все 60 дней помечены как занятые, "
+                f"извлечение цен пропущено."
+            )
+            calendar_60 = [1] * CALENDAR_DAYS_TARGET
+            prices_60 = [0] * CALENDAR_DAYS_TARGET
+            min_stay = calendar_data.get("minStay", 1)
+        else:
+            calendar_60 = self._pad_array(raw_calendar, 60, 0)
+            min_stay = calendar_data.get("minStay", 1)
+
+            # === Извлечение реальных цен через датепикер ===
+            prices_60 = await self._extract_prices_for_free_days(
+                current_page,
+                external_id,
+                calendar_60,
+                min_stay,
+                base_price,
+            )
 
         listing = RawListing(
             external_id=external_id,
@@ -357,6 +382,7 @@ class ListingService:
             avg_price=round(listing.average_price),
             is_instant_book=instant_book,
             host_rating=host_rating,
+            calendar_available=not calendar_failed,
         )
 
         return listing
