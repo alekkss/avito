@@ -602,7 +602,7 @@ class ListingService:
             #   назначаем ту же цену, добавляем в processed_by_min_stay.
             # — если день уже свободен (0) → не трогаем,
             #   он будет обработан отдельно со своей ценой.
-            for offset in range(1, actual_min_stay + 1):
+            for offset in range(1, actual_min_stay):
                 unlock_idx = day_idx + offset
                 if unlock_idx >= CALENDAR_DAYS_TARGET:
                     break
