@@ -61,7 +61,7 @@ from src.services.scraper_service import CatalogItem
 # --- Константы ---
 
 # Количество параллельных воркеров
-NUM_WORKERS: int = 3
+NUM_WORKERS: int = 8
 
 # Объявлений на один воркер
 LISTINGS_PER_WORKER: int = 10
@@ -583,12 +583,12 @@ async def parse_catalog(
 
 
 async def run_test_pipeline(settings: Settings) -> None:
-    """Запускает тестовый конвейер с 3 параллельными воркерами.
+    """Запускает тестовый конвейер с параллельными воркерами.
 
     Полный цикл:
-    1. Парсинг каталога (1 прокси) → 30 объявлений.
-    2. Разбивка на 3 группы по 10.
-    3. Запуск 3 воркеров параллельно (asyncio.gather).
+    1. Парсинг каталога (1 прокси) → объявления.
+    2. Разбивка на группы по LISTINGS_PER_WORKER.
+    3. Запуск воркеров параллельно (asyncio.gather).
     4. Сбор результатов → failover для проваленных карточек.
     5. Экспорт в Excel.
 
@@ -606,8 +606,8 @@ async def run_test_pipeline(settings: Settings) -> None:
         f"\n  ТЕСТОВЫЙ ПРОГОН: {NUM_WORKERS} потока × "
         f"{LISTINGS_PER_WORKER} объявлений = {TOTAL_LISTINGS} шт."
         f"\n  Прокси в пуле: {len(proxies)} "
-        f"(3 основных + {max(0, len(proxies) - NUM_WORKERS)} "
-        f"для failover)"
+        f"({NUM_WORKERS} основных + "
+        f"{max(0, len(proxies) - NUM_WORKERS)} для failover)"
         f"\n{'=' * 65}"
     )
 
@@ -616,6 +616,9 @@ async def run_test_pipeline(settings: Settings) -> None:
         db_path=settings.database.db_path,
     )
     repository.initialize()
+
+    # Список ВСЕХ результатов воркеров (основные + failover)
+    all_worker_results: list[WorkerResult] = []
 
     try:
         # === ЭТАП 1: Парсинг каталога ===
@@ -719,6 +722,7 @@ async def run_test_pipeline(settings: Settings) -> None:
                 )
                 continue
 
+            all_worker_results.append(r)
             all_successful.extend(r.successful)
             all_failed.extend(r.failed_items)
 
@@ -779,6 +783,7 @@ async def run_test_pipeline(settings: Settings) -> None:
                 repository=repository,
             )
 
+            all_worker_results.append(failover_result)
             all_successful.extend(failover_result.successful)
             all_failed.extend(failover_result.failed_items)
 
@@ -825,6 +830,110 @@ async def run_test_pipeline(settings: Settings) -> None:
             f"\n  Тестовая БД:               {TEST_DB_PATH}"
             f"\n  Тестовый Excel:            {TEST_EXPORT_PATH}"
         )
+
+        # --- Статистика по воркерам ---
+        if all_worker_results:
+            print(f"\n  {'─' * 61}")
+            print("  ВРЕМЯ ВЫПОЛНЕНИЯ ВОРКЕРОВ")
+            print(f"  {'─' * 61}")
+
+            # Сортируем по worker_id для наглядности
+            sorted_results = sorted(
+                all_worker_results, key=lambda r: r.worker_id,
+            )
+
+            for wr in sorted_results:
+                # Определяем тип: основной или failover
+                worker_type = (
+                    "основной"
+                    if wr.worker_id <= NUM_WORKERS
+                    else "failover"
+                )
+                status_icon = (
+                    "✅" if not wr.failed_items else "⚠️ "
+                )
+
+                # Среднее время на карточку (если были успешные)
+                cards_total = (
+                    len(wr.successful) + len(wr.failed_items)
+                )
+                avg_per_card = (
+                    wr.elapsed / cards_total
+                    if cards_total > 0
+                    else 0.0
+                )
+
+                print(
+                    f"    {status_icon} worker_{wr.worker_id:>2} "
+                    f"({worker_type:>8}): "
+                    f"{wr.elapsed:>7.1f} сек "
+                    f"| {len(wr.successful):>2} ✅ "
+                    f"{len(wr.failed_items):>2} ❌ "
+                    f"| ~{avg_per_card:.1f} сек/карточка "
+                    f"| {wr.proxy_server}"
+                )
+
+            # Сводная статистика
+            elapsed_list = [
+                wr.elapsed for wr in all_worker_results
+            ]
+            avg_elapsed = (
+                sum(elapsed_list) / len(elapsed_list)
+            )
+            min_elapsed = min(elapsed_list)
+            max_elapsed = max(elapsed_list)
+
+            # Среднее время на карточку по всем воркерам
+            total_cards = sum(
+                len(wr.successful) + len(wr.failed_items)
+                for wr in all_worker_results
+            )
+            total_time = sum(elapsed_list)
+            avg_per_card_global = (
+                total_time / total_cards
+                if total_cards > 0
+                else 0.0
+            )
+
+            print(f"\n  {'─' * 61}")
+            print(
+                f"  Среднее время воркера:     "
+                f"{avg_elapsed:.1f} сек"
+            )
+            print(
+                f"  Минимальное:               "
+                f"{min_elapsed:.1f} сек"
+            )
+            print(
+                f"  Максимальное:              "
+                f"{max_elapsed:.1f} сек"
+            )
+            print(
+                f"  Разброс (макс − мин):      "
+                f"{max_elapsed - min_elapsed:.1f} сек"
+            )
+            print(
+                f"  Среднее на карточку:       "
+                f"{avg_per_card_global:.1f} сек"
+            )
+
+            # Логируем сводку по воркерам
+            worker_timings = {
+                f"worker_{wr.worker_id}": round(wr.elapsed, 1)
+                for wr in sorted_results
+            }
+            logger.info(
+                "workers_timing_summary",
+                worker_count=len(all_worker_results),
+                avg_elapsed=round(avg_elapsed, 1),
+                min_elapsed=round(min_elapsed, 1),
+                max_elapsed=round(max_elapsed, 1),
+                spread=round(max_elapsed - min_elapsed, 1),
+                avg_per_card=round(avg_per_card_global, 1),
+                total_cards=total_cards,
+                timings=worker_timings,
+            )
+
         if all_failed:
             print(
                 f"\n  ⚠️  Неспарсенные карточки: "
