@@ -357,7 +357,7 @@ def load_settings() -> Settings:
 
     # --- Логирование ---
     log_level_raw = os.getenv("LOG_LEVEL", "INFO")
-    log_file_path = os.getenv("LOG_FILE_PATH", "")
+    log_file_path = os.getenv("LOG_FILE_PATH", "logs/app.log")
 
     try:
         log_level = _validate_log_level(log_level_raw)

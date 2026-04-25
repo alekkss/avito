@@ -43,3 +43,5 @@ Thumbs.db
 
 create_promo.py
 reset_user.py
+
+logs/

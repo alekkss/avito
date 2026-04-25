@@ -1,7 +1,8 @@
 """Модуль логирования с человекочитаемым форматом.
 
 Консольный вывод — понятные цветные сообщения на русском.
-Файловый вывод (опционально) — JSON для машинного анализа.
+Файловый вывод (опционально) — JSON для машинного анализа
+с ротацией по размеру (10 МБ, 5 бэкапов).
 
 Пример вывода в консоль:
     [09:27:36] ✅ INFO     Страница спарсена | page=5 items=50 total=250
@@ -15,11 +16,16 @@ import sys
 import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 
 _trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
+
+# Настройки ротации логов
+_LOG_MAX_BYTES: int = 10 * 1024 * 1024  # 10 МБ
+_LOG_BACKUP_COUNT: int = 5  # Хранить до 5 архивных файлов
 
 
 def set_trace_id(trace_id: str | None = None) -> str:
@@ -239,7 +245,8 @@ def setup_logging(level: str = "INFO", log_file_path: str = "") -> None:
     """Настраивает логирование.
 
     Консоль — человекочитаемый цветной формат.
-    Файл (опционально) — JSON для машинного анализа.
+    Файл (опционально) — JSON с ротацией по размеру
+    (10 МБ на файл, до 5 архивных копий).
 
     Args:
         level: Уровень логирования.
@@ -254,12 +261,15 @@ def setup_logging(level: str = "INFO", log_file_path: str = "") -> None:
     console_handler.setFormatter(HumanFormatter())
     root_logger.addHandler(console_handler)
 
-    # Файл — JSON формат (если задан путь)
+    # Файл — JSON формат с ротацией (если задан путь)
     if log_file_path:
         log_path = Path(log_file_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(
-            str(log_path), encoding="utf-8"
+        file_handler = RotatingFileHandler(
+            filename=str(log_path),
+            maxBytes=_LOG_MAX_BYTES,
+            backupCount=_LOG_BACKUP_COUNT,
+            encoding="utf-8",
         )
         file_handler.setFormatter(JSONFileFormatter())
         root_logger.addHandler(file_handler)
