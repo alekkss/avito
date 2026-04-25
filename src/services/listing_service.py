@@ -4,6 +4,11 @@
 детальные данные: координаты, календарь занятости, цены на
 60 дней вперёд, условия аренды и информацию о хосте.
 
+При обнаружении блокировки — сообщает трекеру здоровья прокси
+о бане (через BrowserService.report_ban()), при успехе —
+об успехе (BrowserService.report_success()). Это позволяет
+трекеру автоматически исключать «мёртвые» прокси из пула.
+
 Паттерн Strategy: при переходе на другую площадку (Суточно.ру)
 можно создать альтернативную реализацию с тем же интерфейсом.
 """
@@ -220,8 +225,12 @@ class ListingService:
     все детальные данные, недоступные из каталога: координаты,
     календарь, цены на 60 дней, условия аренды.
 
-    При обнаружении блокировки — ожидает и повторяет. Если
-    стандартные retry исчерпаны и доступны прокси — выполняет
+    При обнаружении блокировки — сообщает трекеру здоровья через
+    BrowserService.report_ban(). При успешном парсинге — вызывает
+    BrowserService.report_success(). Это позволяет трекеру
+    автоматически исключать прокси с высоким процентом банов.
+
+    При стандартных retry исчерпаны и доступны прокси — выполняет
     ротацию прокси и пробует снова с новым IP.
 
     Attributes:
@@ -251,6 +260,11 @@ class ListingService:
         Переходит на страницу объявления, извлекает все детальные
         данные, затем проходит по каждому свободному дню и через
         датепикер получает реальную цену за сутки.
+
+        При успешном парсинге сообщает трекеру здоровья об успехе
+        текущего прокси. При провале (календарь не загрузился) —
+        не сообщает (бан уже зарегистрирован в _navigate_to_listing
+        или _retry_with_proxy_rotation).
 
         Если календарь (datepicker) не удалось загрузить после
         всех попыток перезагрузки — карточка считается проваленной
@@ -371,6 +385,9 @@ class ListingService:
             url=url,
             title=title,
         )
+
+        # Успешный парсинг — сообщаем трекеру
+        self._browser_service.report_success()
 
         logger.info(
             "listing_parsed",
@@ -597,11 +614,6 @@ class ListingService:
             prices[day_idx] = resolved_price
 
             # === Разблокировка дней по минимальному сроку ===
-            # Следующие (actual_min_stay - 1) дней после текущего:
-            # — если день был занят (1) → разблокируем (ставим 0),
-            #   назначаем ту же цену, добавляем в processed_by_min_stay.
-            # — если день уже свободен (0) → не трогаем,
-            #   он будет обработан отдельно со своей ценой.
             for offset in range(1, actual_min_stay):
                 unlock_idx = day_idx + offset
                 if unlock_idx >= CALENDAR_DAYS_TARGET:
@@ -828,9 +840,7 @@ class ListingService:
         Кликает на элемент с role="button" и
         data-marker="datepicker/content" — родительский контейнер
         кликабельной ячейки дня. Именно этот элемент обрабатывает
-        события клика в React-приложении Avito. Клик на вложенный
-        <div data-marker="datepicker-day-available"> не вызывает
-        обработчик бронирования, т.к. Avito проверяет event.target.
+        события клика в React-приложении Avito.
 
         Args:
             target_year: Год.
@@ -842,9 +852,6 @@ class ListingService:
         """
         target_month_0 = target_month - 1
 
-        # Ищем родительский div[role="button"][data-marker="datepicker/content"],
-        # внутри которого есть div[data-marker="datepicker-day-available"]
-        # с текстом, совпадающим с нужным днём.
         el_handle = await page.evaluate_handle(
             f"""() => {{
                 const cal = document.querySelector(
@@ -964,9 +971,9 @@ class ListingService:
     ) -> bool:
         """Переходит на карточку объявления и проверяет блокировку.
 
-        Выполняет навигацию с задержкой, проверяет блокировку
-        и при необходимости ожидает разблокировки стандартным
-        retry-механизмом (5 попыток).
+        При обнаружении блокировки сообщает трекеру здоровья
+        о бане текущего прокси и пытается дождаться разблокировки
+        стандартным retry-механизмом (5 попыток).
 
         Args:
             page: Активная страница Playwright.
@@ -1005,12 +1012,17 @@ class ListingService:
         # Проверяем блокировку с retry-логикой
         is_blocked = await self._browser_service._check_blocked()
         if is_blocked:
+            # Сообщаем трекеру о бане текущего прокси
+            self._browser_service.report_ban()
+
             unblocked = await self._wait_for_listing_unblock(
                 page, external_id, full_url
             )
             if not unblocked:
                 return False
 
+        # Навигация успешна — сообщаем трекеру
+        self._browser_service.report_success()
         return True
 
     async def _retry_with_proxy_rotation(
@@ -1019,6 +1031,11 @@ class ListingService:
         full_url: str,
     ) -> Page | None:
         """Пробует сменить прокси и повторно зайти на карточку.
+
+        После каждой неудачной ротации сообщает трекеру о бане.
+        После успеха — сообщает об успехе. Трекер автоматически
+        исключит прокси с высоким процентом банов из пула,
+        ускоряя ротацию на последующих карточках.
 
         Выполняет до MAX_PROXY_ROTATIONS_PER_LISTING ротаций прокси.
         После каждой ротации — навигация на карточку + стандартный
@@ -1035,7 +1052,7 @@ class ListingService:
             logger.warning(
                 "proxy_rotation_unavailable",
                 external_id=external_id,
-                reason="прокси не загружены",
+                reason="нет здоровых прокси в пуле",
             )
             return None
 
@@ -1079,6 +1096,8 @@ class ListingService:
                 )
                 return new_page
 
+            # Навигация не удалась — _navigate_to_listing уже
+            # вызвал report_ban() внутри себя
             logger.warning(
                 "listing_still_blocked_after_rotation",
                 external_id=external_id,
@@ -1185,6 +1204,9 @@ class ListingService:
                 f"  [блокировка] Всё ещё заблокировано "
                 f"(попытка {attempt}/{MAX_LISTING_UNBLOCK_RETRIES})"
             )
+
+        # Все retry исчерпаны — бан подтверждён
+        self._browser_service.report_ban()
 
         logger.error(
             "listing_block_not_resolved",
@@ -1418,6 +1440,9 @@ class ListingService:
     ) -> bool:
         """Перезагружает страницу и повторно пытается открыть datepicker.
 
+        При обнаружении блокировки после перезагрузки — сообщает
+        трекеру о бане текущего прокси.
+
         Выполняет до MAX_CALENDAR_RELOAD_RETRIES попыток:
         ожидание CALENDAR_RELOAD_WAIT_SECONDS секунд →
         перезагрузка страницы → попытка открыть datepicker.
@@ -1475,6 +1500,9 @@ class ListingService:
             # Проверяем, не заблокирована ли страница после reload
             is_blocked = await self._browser_service._check_blocked()
             if is_blocked:
+                # Сообщаем трекеру о бане
+                self._browser_service.report_ban()
+
                 logger.warning(
                     "page_blocked_after_reload_for_calendar",
                     external_id=external_id,
@@ -1844,8 +1872,6 @@ class ListingService:
                     return None
                 await asyncio.sleep(0.5)
 
-            # Кликаем на родительский div[data-marker="datepicker/content"],
-            # содержащий доступный день, чтобы Avito JS корректно обработал
             free_content_cells = await page.query_selector_all(
                 "[data-marker='datepicker'] "
                 "[data-marker='datepicker/content']:not([data-disabled='true'])"

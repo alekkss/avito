@@ -8,6 +8,9 @@
 - Автономный (launch): загружает прокси из файла, запускает свой Chromium.
 - Воркер (launch_for_worker): использует переданный Browser-инстанс
   и назначенные прокси, не управляет жизненным циклом Playwright/Browser.
+
+Интегрирован с ProxyHealthTracker для автоматического исключения
+«мёртвых» прокси (забаненных Avito или не отвечающих) из пула ротации.
 """
 
 import asyncio
@@ -24,6 +27,7 @@ from playwright.async_api import (
 )
 
 from src.config import BrowserSettings, ProxySettings, get_logger
+from src.services.proxy_health import ProxyHealthTracker
 
 logger = get_logger("browser_service")
 
@@ -252,6 +256,11 @@ class BrowserService:
     контекста, stealth-инъекции, ротацию прокси и имитацию поведения
     пользователя.
 
+    Интегрирован с ProxyHealthTracker: при каждой навигации сообщает
+    трекеру о результате (успех, бан, ошибка соединения). Трекер
+    автоматически исключает «мёртвые» прокси из пула, что ускоряет
+    ротацию и снижает количество бесполезных попыток.
+
     Поддерживает два режима:
     - Автономный: вызов launch() создаёт свой Playwright + Browser.
     - Воркер: вызов launch_for_worker() использует переданный Browser,
@@ -266,12 +275,14 @@ class BrowserService:
         _context: Контекст браузера с настройками.
         _page: Активная страница.
         _proxies: Список загруженных/назначенных прокси.
-        _current_proxy_index: Индекс текущего прокси в списке.
+        _proxy_map: Словарь server → ProxyInfo для быстрого поиска.
+        _current_proxy_server: URL текущего активного прокси (или "").
         _listings_since_rotation: Счётчик карточек с последней ротации.
         _owns_browser: True если этот экземпляр управляет жизненным
             циклом Playwright и Browser (автономный режим).
         _worker_id: Идентификатор воркера для логирования (None если
             автономный режим).
+        _health_tracker: Трекер здоровья прокси.
     """
 
     def __init__(
@@ -280,6 +291,7 @@ class BrowserService:
         proxy_settings: ProxySettings,
         assigned_proxies: list[ProxyInfo] | None = None,
         worker_id: int | None = None,
+        health_tracker: ProxyHealthTracker | None = None,
     ) -> None:
         """Инициализирует сервис.
 
@@ -291,6 +303,8 @@ class BrowserService:
                 Если None — прокси загружаются из файла при launch().
             worker_id: Идентификатор воркера для логирования.
                 None — автономный режим (каталог).
+            health_tracker: Трекер здоровья прокси. Если None —
+                создаётся внутренний экземпляр (обратная совместимость).
         """
         self._settings = settings
         self._proxy_settings = proxy_settings
@@ -300,10 +314,16 @@ class BrowserService:
         self._page: Page | None = None
         self._assigned_proxies = assigned_proxies
         self._proxies: list[ProxyInfo] = []
-        self._current_proxy_index: int = -1
+        self._proxy_map: dict[str, ProxyInfo] = {}
+        self._current_proxy_server: str = ""
         self._listings_since_rotation: int = 0
         self._owns_browser: bool = True
         self._worker_id = worker_id
+        self._health_tracker = (
+            health_tracker
+            if health_tracker is not None
+            else ProxyHealthTracker()
+        )
 
     def _log_prefix(self) -> str:
         """Возвращает префикс для логов с идентификатором воркера.
@@ -318,6 +338,9 @@ class BrowserService:
     def _load_proxies(self) -> None:
         """Загружает прокси из файла или использует назначенные.
 
+        После загрузки регистрирует все прокси в health_tracker
+        и строит словарь server → ProxyInfo для быстрого поиска.
+
         Если в конструктор переданы assigned_proxies — использует их.
         Иначе загружает из файла по пути из настроек.
         При пустом пути — парсер работает без прокси.
@@ -325,28 +348,27 @@ class BrowserService:
         # Если прокси назначены извне (режим воркера) — используем их
         if self._assigned_proxies is not None:
             self._proxies = list(self._assigned_proxies)
-            logger.info(
-                "proxies_assigned",
-                source=self._log_prefix(),
-                total=len(self._proxies),
-                rotate_every=self._proxy_settings.rotate_every_n,
+        elif self._proxy_settings.proxy_file_path:
+            # Автономный режим — загружаем из файла
+            self._proxies = load_proxies_from_file(
+                self._proxy_settings.proxy_file_path
             )
-            return
-
-        # Автономный режим — загружаем из файла
-        if not self._proxy_settings.proxy_file_path:
+            # Перемешиваем для равномерного распределения нагрузки
+            random.shuffle(self._proxies)
+        else:
             logger.info(
                 "proxy_disabled_no_file",
                 source=self._log_prefix(),
             )
             return
 
-        self._proxies = load_proxies_from_file(
-            self._proxy_settings.proxy_file_path
-        )
+        # Строим словарь server → ProxyInfo для быстрого поиска
+        self._proxy_map = {p.server: p for p in self._proxies}
 
-        # Перемешиваем для равномерного распределения нагрузки
-        random.shuffle(self._proxies)
+        # Регистрируем в трекере здоровья
+        self._health_tracker.register_many(
+            [p.server for p in self._proxies]
+        )
 
         logger.info(
             "proxies_ready",
@@ -356,39 +378,98 @@ class BrowserService:
         )
 
     def _get_next_proxy(self) -> ProxyInfo | None:
-        """Возвращает следующий прокси из пула.
+        """Возвращает следующий здоровый прокси из пула.
 
-        Циклически перебирает список прокси. Если прокси
-        закончились — начинает сначала.
+        Делегирует выбор ProxyHealthTracker, который пропускает
+        прокси со статусом DEAD. Если все прокси мертвы —
+        возвращает None.
 
         Returns:
-            Следующий ProxyInfo или None, если прокси не загружены.
+            Следующий здоровый ProxyInfo или None.
         """
         if not self._proxies:
             return None
 
-        self._current_proxy_index += 1
+        healthy_server = self._health_tracker.get_next_healthy()
 
-        # Циклический перебор
-        if self._current_proxy_index >= len(self._proxies):
-            self._current_proxy_index = 0
-            logger.info(
-                "proxy_pool_recycled",
+        if healthy_server is None:
+            logger.error(
+                "no_healthy_proxies_available",
                 source=self._log_prefix(),
                 total=len(self._proxies),
             )
+            return None
 
-        proxy = self._proxies[self._current_proxy_index]
+        proxy = self._proxy_map.get(healthy_server)
+
+        if proxy is None:
+            logger.error(
+                "proxy_not_found_in_map",
+                source=self._log_prefix(),
+                server=healthy_server,
+            )
+            return None
 
         logger.info(
             "proxy_selected",
             source=self._log_prefix(),
-            index=self._current_proxy_index,
-            total=len(self._proxies),
             server=proxy.server,
+            alive=self._health_tracker.alive_count,
+            total=self._health_tracker.total_count,
         )
 
         return proxy
+
+    @property
+    def current_proxy_server(self) -> str:
+        """URL текущего активного прокси.
+
+        Returns:
+            URL прокси-сервера или пустая строка если без прокси.
+        """
+        return self._current_proxy_server
+
+    @property
+    def health_tracker(self) -> ProxyHealthTracker:
+        """Возвращает трекер здоровья прокси.
+
+        Используется для финального отчёта и для передачи
+        в другие сервисы (ParallelListingService).
+
+        Returns:
+            Экземпляр ProxyHealthTracker.
+        """
+        return self._health_tracker
+
+    def report_success(self) -> None:
+        """Сообщает трекеру об успешном использовании текущего прокси.
+
+        Вызывается из ListingService после успешного парсинга
+        карточки — сбрасывает серию банов текущего прокси.
+        """
+        if self._current_proxy_server:
+            self._health_tracker.report_success(
+                self._current_proxy_server
+            )
+
+    def report_ban(self) -> None:
+        """Сообщает трекеру о бане текущего прокси.
+
+        Вызывается из ListingService при обнаружении блокировки
+        на странице карточки.
+        """
+        if self._current_proxy_server:
+            self._health_tracker.report_ban(
+                self._current_proxy_server
+            )
+            logger.info(
+                "ban_reported_to_tracker",
+                source=self._log_prefix(),
+                server=self._current_proxy_server,
+                is_dead=self._health_tracker.is_dead(
+                    self._current_proxy_server
+                ),
+            )
 
     async def _create_context(
         self, proxy: ProxyInfo | None = None
@@ -509,8 +590,11 @@ class BrowserService:
 
             self._owns_browser = True
 
-            # Берём первый прокси (или None, если прокси отключены)
+            # Берём первый здоровый прокси (или None)
             first_proxy = self._get_next_proxy()
+            self._current_proxy_server = (
+                first_proxy.server if first_proxy else ""
+            )
 
             self._context = await self._create_context(
                 proxy=first_proxy,
@@ -528,9 +612,7 @@ class BrowserService:
                 headless=self._settings.headless,
                 timeout=self._settings.navigation_timeout,
                 proxy_enabled=len(self._proxies) > 0,
-                proxy_server=(
-                    first_proxy.server if first_proxy else "нет"
-                ),
+                proxy_server=self._current_proxy_server or "нет",
             )
 
             return self._page
@@ -574,8 +656,11 @@ class BrowserService:
             # Загружаем назначенные прокси (без чтения файла)
             self._load_proxies()
 
-            # Берём первый прокси из назначенного пула
+            # Берём первый здоровый прокси из назначенного пула
             first_proxy = self._get_next_proxy()
+            self._current_proxy_server = (
+                first_proxy.server if first_proxy else ""
+            )
 
             self._context = await self._create_context(
                 proxy=first_proxy,
@@ -592,9 +677,7 @@ class BrowserService:
                 source=self._log_prefix(),
                 proxy_enabled=len(self._proxies) > 0,
                 proxy_count=len(self._proxies),
-                proxy_server=(
-                    first_proxy.server if first_proxy else "нет"
-                ),
+                proxy_server=self._current_proxy_server or "нет",
             )
 
             return self._page
@@ -613,18 +696,20 @@ class BrowserService:
             ) from e
 
     async def rotate_proxy(self) -> Page:
-        """Переключается на следующий прокси из пула.
+        """Переключается на следующий здоровый прокси из пула.
 
         Закрывает текущий контекст (cookies, session, fingerprint),
-        берёт следующий прокси, создаёт полностью новый контекст
-        с новым User-Agent, viewport и прокси. Chromium-процесс
-        НЕ перезапускается — пересоздаётся только BrowserContext.
+        берёт следующий здоровый прокси через трекер, создаёт
+        полностью новый контекст с новым User-Agent, viewport
+        и прокси. Chromium-процесс НЕ перезапускается.
+
+        Если все прокси мертвы — выбрасывает RuntimeError.
 
         Returns:
             Новая страница Playwright с чистым контекстом.
 
         Raises:
-            RuntimeError: Если прокси не загружены или браузер не запущен.
+            RuntimeError: Если нет здоровых прокси или браузер не запущен.
         """
         if not self._proxies:
             raise RuntimeError(
@@ -637,7 +722,7 @@ class BrowserService:
                 "Ротация прокси невозможна: браузер не запущен."
             )
 
-        old_proxy_index = self._current_proxy_index
+        old_proxy_server = self._current_proxy_server
 
         # Закрываем текущий контекст (чистим cookies, session, fingerprint)
         if self._context is not None:
@@ -652,8 +737,17 @@ class BrowserService:
             self._context = None
             self._page = None
 
-        # Берём следующий прокси
+        # Берём следующий здоровый прокси через трекер
         next_proxy = self._get_next_proxy()
+
+        if next_proxy is None:
+            raise RuntimeError(
+                "Ротация прокси невозможна: все прокси исключены "
+                "из пула (DEAD). Добавьте новые прокси в "
+                "proxies.txt."
+            )
+
+        self._current_proxy_server = next_proxy.server
 
         # Создаём полностью новый контекст
         self._context = await self._create_context(proxy=next_proxy)
@@ -667,10 +761,10 @@ class BrowserService:
         logger.info(
             "proxy_rotated",
             source=self._log_prefix(),
-            old_index=old_proxy_index,
-            new_index=self._current_proxy_index,
-            new_server=next_proxy.server if next_proxy else "нет",
-            listings_before_rotation=self._listings_since_rotation,
+            old_server=old_proxy_server,
+            new_server=next_proxy.server,
+            alive=self._health_tracker.alive_count,
+            total=self._health_tracker.total_count,
         )
 
         # Пауза после смены прокси — имитация нового пользователя
@@ -719,12 +813,14 @@ class BrowserService:
 
     @property
     def has_proxies(self) -> bool:
-        """Проверяет, загружены ли прокси.
+        """Проверяет, есть ли здоровые прокси в пуле.
 
         Returns:
-            True если список прокси не пуст.
+            True если есть хотя бы один живой прокси.
         """
-        return len(self._proxies) > 0
+        if not self._proxies:
+            return False
+        return self._health_tracker.alive_count > 0
 
     async def navigate(self, url: str) -> bool:
         """Переходит по URL с предварительной задержкой и проверкой блокировки.
@@ -734,8 +830,9 @@ class BrowserService:
         проверками, валидация загрузки контента Avito.
 
         При ошибке прокси-соединения (ERR_TUNNEL_CONNECTION_FAILED и др.)
-        автоматически переключается на следующий прокси из пула и
-        повторяет навигацию — до MAX_PROXY_RETRIES_ON_NAVIGATE попыток.
+        сообщает трекеру об ошибке и автоматически переключается
+        на следующий здоровый прокси. При бане — сообщает трекеру о бане.
+        При успехе — сообщает трекеру об успехе.
 
         Args:
             url: URL для перехода.
@@ -754,14 +851,28 @@ class BrowserService:
         # Первая попытка навигации
         result = await self._try_navigate(url)
         if result is True:
+            # Успех — сообщаем трекеру
+            if self._current_proxy_server:
+                self._health_tracker.report_success(
+                    self._current_proxy_server
+                )
             return True
 
-        # result is False — обычная ошибка (блокировка, CloudFlare и т.д.)
-        # result is None — ошибка прокси, нужна ротация
+        # result is False — блокировка/бан (прокси работает, но забанен)
         if result is not None:
+            if self._current_proxy_server:
+                self._health_tracker.report_ban(
+                    self._current_proxy_server
+                )
             return False
 
-        # === Ошибка прокси → автоматический перебор ===
+        # result is None — ошибка прокси-соединения
+        if self._current_proxy_server:
+            self._health_tracker.report_connection_error(
+                self._current_proxy_server
+            )
+
+        # === Ошибка прокси → автоматический перебор здоровых ===
         if not self._proxies:
             logger.error(
                 "proxy_error_no_proxies_to_retry",
@@ -770,9 +881,17 @@ class BrowserService:
             )
             return False
 
-        max_retries = min(
-            MAX_PROXY_RETRIES_ON_NAVIGATE, len(self._proxies)
-        )
+        alive_count = self._health_tracker.alive_count
+        max_retries = min(MAX_PROXY_RETRIES_ON_NAVIGATE, alive_count)
+
+        if max_retries <= 0:
+            logger.error(
+                "no_healthy_proxies_for_retry",
+                source=self._log_prefix(),
+                url=url[:200],
+                total=len(self._proxies),
+            )
+            return False
 
         for retry in range(1, max_retries + 1):
             logger.warning(
@@ -781,6 +900,7 @@ class BrowserService:
                 url=url[:200],
                 retry=retry,
                 max_retries=max_retries,
+                alive=self._health_tracker.alive_count,
             )
             print(
                 f"  [{self._log_prefix()}][прокси] Прокси не работает. "
@@ -797,10 +917,16 @@ class BrowserService:
                     retry=retry,
                     error=str(e),
                 )
-                continue
+                return False
 
             result = await self._try_navigate(url)
             if result is True:
+                # Успех с новым прокси
+                if self._current_proxy_server:
+                    self._health_tracker.report_success(
+                        self._current_proxy_server
+                    )
+
                 logger.info(
                     "navigation_success_after_proxy_retry",
                     source=self._log_prefix(),
@@ -809,13 +935,17 @@ class BrowserService:
                 )
                 print(
                     f"  [{self._log_prefix()}][прокси] "
-                    f"Прокси #{self._current_proxy_index} "
+                    f"Прокси {self._current_proxy_server} "
                     f"работает! Навигация успешна."
                 )
                 return True
 
             # result is False — страница загрузилась, но заблокирована
             if result is not None:
+                if self._current_proxy_server:
+                    self._health_tracker.report_ban(
+                        self._current_proxy_server
+                    )
                 logger.warning(
                     "navigation_blocked_after_proxy_retry",
                     source=self._log_prefix(),
@@ -824,12 +954,17 @@ class BrowserService:
                 )
                 return False
 
-            # result is None — снова ошибка прокси, пробуем следующий
+            # result is None — снова ошибка прокси-соединения
+            if self._current_proxy_server:
+                self._health_tracker.report_connection_error(
+                    self._current_proxy_server
+                )
+
             logger.debug(
                 "proxy_still_failing",
                 source=self._log_prefix(),
                 retry=retry,
-                proxy_index=self._current_proxy_index,
+                server=self._current_proxy_server,
             )
 
         logger.error(
@@ -898,7 +1033,7 @@ class BrowserService:
                     source=self._log_prefix(),
                     url=url[:200],
                     error=error_text[:300],
-                    proxy_index=self._current_proxy_index,
+                    server=self._current_proxy_server,
                 )
                 return None
 
@@ -1009,8 +1144,6 @@ class BrowserService:
                     return "cloudflare"
 
             # Проверяем наличие реального контента Avito на странице.
-            # Ищем характерные элементы: каталог товаров, шапка сайта,
-            # поисковая строка. Если хотя бы один найден — страница ОК.
             avito_selectors = (
                 "div[data-marker='catalog-serp']",
                 "div[data-marker='search-form']",
@@ -1030,7 +1163,7 @@ class BrowserService:
                     return "ok"
 
             # Если заголовок содержит "Avito" или "Авито" —
-            # скорее всего страница загрузилась, просто нет товаров
+            # скорее всего страница загрузилась
             if "avito" in title.lower() or "авито" in title.lower():
                 logger.debug(
                     "avito_title_found",
@@ -1039,8 +1172,6 @@ class BrowserService:
                 )
                 return "ok"
 
-            # Ни блокировки, ни CloudFlare, ни контента Avito —
-            # возможно страница ещё грузится
             return "unknown"
 
         except Exception as e:

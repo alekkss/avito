@@ -8,6 +8,8 @@
         ExportService,
         ParallelListingService,
         CatalogItemForWorker,
+        ProxyHealthTracker,
+        ProxyStatus,
     )
 """
 
@@ -18,6 +20,7 @@ from src.services.parallel_listing_service import (
     CatalogItemForWorker,
     ParallelListingService,
 )
+from src.services.proxy_health import ProxyHealthTracker, ProxyStatus
 from src.services.scraper_service import ScraperService
 
 __all__ = [
@@ -26,5 +29,7 @@ __all__ = [
     "ListingService",
     "ParallelListingService",
     "CatalogItemForWorker",
+    "ProxyHealthTracker",
+    "ProxyStatus",
     "ScraperService",
 ]

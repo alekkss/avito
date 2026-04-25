@@ -5,6 +5,9 @@
 Карточки распределяются через asyncio.Queue — воркер, освободившийся
 первым, берёт следующую карточку (балансировка нагрузки).
 
+Все воркеры разделяют один ProxyHealthTracker — если прокси забанен
+у одного воркера, остальные об этом узнают и пропустят его при ротации.
+
 Паттерн Strategy: ParallelListingService заменяет последовательный
 обход карточек в ScraperService._parse_all_listings() на параллельный,
 не меняя логику парсинга отдельной карточки (ListingService).
@@ -26,6 +29,7 @@ from src.services.browser_service import (
     load_proxies_from_file,
 )
 from src.services.listing_service import ListingService
+from src.services.proxy_health import ProxyHealthTracker
 
 logger = get_logger("parallel_listing_service")
 
@@ -178,6 +182,11 @@ class ParallelListingService:
     каждый со своим прокси. Карточки распределяются через
     asyncio.Queue — воркер, освободившийся первым, берёт следующую.
 
+    Все воркеры разделяют один ProxyHealthTracker. Когда прокси
+    получает баны у любого воркера — трекер помечает его как DEAD,
+    и все остальные воркеры автоматически пропускают его при ротации.
+    Это устраняет бесполезные retry на заведомо мёртвых прокси.
+
     При отсутствии прокси или max_workers=1 — работает в один
     поток, полностью совместим с текущим поведением.
 
@@ -210,9 +219,10 @@ class ParallelListingService:
     ) -> list[RawListing]:
         """Обрабатывает все карточки объявлений параллельно.
 
-        Основной публичный метод. Загружает прокси, определяет
-        количество воркеров, запускает общий Chromium, создаёт
-        воркеров и ожидает завершения всех.
+        Основной публичный метод. Загружает прокси, создаёт общий
+        ProxyHealthTracker, определяет количество воркеров, запускает
+        общий Chromium, создаёт воркеров с общим трекером и ожидает
+        завершения всех.
 
         Args:
             catalog_items: Список карточек из каталога для обработки.
@@ -226,6 +236,19 @@ class ParallelListingService:
 
         # --- Загружаем прокси ---
         all_proxies = self._load_all_proxies()
+
+        # --- Создаём общий трекер здоровья прокси ---
+        # Один трекер на все воркеры: если прокси забанен у воркера #1,
+        # воркеры #2..N тоже пропустят его при ротации.
+        shared_tracker = ProxyHealthTracker()
+        shared_tracker.register_many(
+            [p.server for p in all_proxies]
+        )
+
+        logger.info(
+            "shared_proxy_health_tracker_created",
+            total_proxies=shared_tracker.total_count,
+        )
 
         # --- Определяем количество воркеров ---
         worker_count = _determine_worker_count(
@@ -286,12 +309,16 @@ class ParallelListingService:
             for worker_id in range(worker_count):
                 worker_proxies = proxy_distribution[worker_id]
 
-                # Создаём отдельный BrowserService для воркера
+                # Создаём BrowserService с общим трекером здоровья.
+                # Все воркеры видят одну и ту же статистику прокси:
+                # бан у воркера #1 → прокси помечен DEAD → воркер #3
+                # при ротации его пропустит.
                 worker_browser_service = BrowserService(
                     settings=self._browser_settings,
                     proxy_settings=self._proxy_settings,
                     assigned_proxies=worker_proxies,
                     worker_id=worker_id,
+                    health_tracker=shared_tracker,
                 )
                 worker_browser_services.append(worker_browser_service)
 
@@ -358,18 +385,33 @@ class ParallelListingService:
                         failed=result.failed,
                     )
 
+            # --- Финальный отчёт здоровья прокси ---
+            shared_tracker.log_summary()
+
             logger.info(
                 "parallel_processing_completed",
                 total_items=len(catalog_items),
                 total_successful=total_successful,
                 total_failed=total_failed,
                 worker_count=worker_count,
+                proxies_alive=shared_tracker.alive_count,
+                proxies_dead=(
+                    shared_tracker.total_count
+                    - shared_tracker.alive_count
+                ),
             )
             print(
                 f"\n  [параллелизация] Завершено: "
                 f"{total_successful} успешно, "
                 f"{total_failed} с ошибками "
                 f"(из {len(catalog_items)} карточек)"
+            )
+            print(
+                f"  [прокси-здоровье] Живых: "
+                f"{shared_tracker.alive_count}/"
+                f"{shared_tracker.total_count}, "
+                f"исключённых: "
+                f"{shared_tracker.total_count - shared_tracker.alive_count}"
             )
 
         finally:
