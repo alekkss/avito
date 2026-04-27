@@ -3,7 +3,8 @@
 Извлекает базовые данные объявлений из HTML-страниц каталога Avito,
 используя CSS-селекторы на основе data-marker атрибутов.
 Поддерживает обход пагинации с retry-логикой, обнаружение
-циклов и детальный парсинг карточек через ListingService.
+циклов, автоматическую ротацию прокси при блокировке
+и детальный парсинг карточек через ListingService.
 
 Публичный интерфейс:
 - scrape_catalog() — обход каталога, возврат списка CatalogItem.
@@ -46,6 +47,16 @@ MAX_INITIAL_NAVIGATION_RETRIES: int = 5
 # Таймаут ожидания контейнера после пагинации (мс)
 # Короткий таймаут: если контейнера нет — товары закончились
 PAGINATION_CONTAINER_TIMEOUT: int = 15000
+
+# Количество неудачных ожиданий разблокировки перед сменой прокси.
+# После 2 попыток (2 × 15 = 30 секунд) — ротация на следующий
+# здоровый прокси вместо бесполезного ожидания на забаненном IP.
+MAX_BLOCK_ATTEMPTS_BEFORE_ROTATION: int = 2
+
+# Максимальное количество ротаций прокси за одну блокировку.
+# Ограничивает перебор прокси, чтобы не исчерпать весь пул
+# на одной странице пагинации.
+MAX_PROXY_ROTATIONS_PER_BLOCK: int = 5
 
 # Тексты бейджа мгновенного бронирования в каталоге
 INSTANT_BOOK_BADGES: tuple[str, ...] = (
@@ -101,7 +112,13 @@ class ScraperService:
     Координирует работу BrowserService для навигации, извлекает
     базовые данные из каталога и запускает детальный парсинг
     карточек через ListingService. Поддерживает пагинацию,
-    обнаружение циклов, ротацию прокси и батчевое сохранение.
+    обнаружение циклов, автоматическую ротацию прокси при блокировке
+    и батчевое сохранение.
+
+    При обнаружении блокировки Avito (CAPTCHA, Access Denied)
+    сервис сначала ожидает разблокировки (2 попытки × 15 секунд),
+    а затем автоматически меняет прокси и повторяет навигацию.
+    Это позволяет продолжить обход каталога без ручного вмешательства.
 
     Публичный интерфейс:
     - scrape_catalog(): обход каталога → список CatalogItem.
@@ -146,6 +163,17 @@ class ScraperService:
         self._seen_avito_ids: set[str] = set()
         self._total_pages: int = 0
         self._base_url: str = ""
+
+    def _get_current_page(self) -> Page | None:
+        """Возвращает актуальную страницу из BrowserService.
+
+        После ротации прокси страница в BrowserService меняется.
+        Этот метод всегда возвращает актуальную ссылку.
+
+        Returns:
+            Текущая активная страница или None.
+        """
+        return self._browser_service.page
 
     def _extract_page_number_from_url(self, url: str) -> int:
         """Извлекает номер страницы из параметра p в URL.
@@ -255,84 +283,280 @@ class ScraperService:
             )
             return 0
 
-    async def _wait_for_unblock(self, page: Page, context: str) -> bool:
-        """Ожидает снятия блокировки Avito с повторными попытками.
+    async def _rotate_and_navigate(
+        self, url: str, context: str
+    ) -> Page | None:
+        """Ротирует прокси, прогревает контекст и переходит по URL.
+
+        Выполняет полный цикл смены IP:
+        1. Ротация прокси через BrowserService.
+        2. Прогрев нового контекста (заход на главную Avito).
+        3. Навигация на целевой URL.
+        4. Проверка блокировки на новом IP.
+
+        Args:
+            url: Целевой URL для навигации после ротации.
+            context: Контекст вызова для логирования.
+
+        Returns:
+            Новая Page если навигация успешна, None при неудаче.
+        """
+        try:
+            new_page = await self._browser_service.rotate_proxy()
+
+            logger.info(
+                "proxy_rotated_for_unblock",
+                context=context,
+                new_proxy=self._browser_service.current_proxy_server,
+            )
+            print(
+                f"  [каталог] Смена прокси → "
+                f"{self._browser_service.current_proxy_server}"
+            )
+
+            # Прогрев нового контекста
+            await self._warmup_after_rotation(new_page)
+
+            # Навигация на целевой URL
+            success = await self._browser_service.navigate(url)
+            if not success:
+                logger.warning(
+                    "navigation_after_rotation_failed",
+                    context=context,
+                    url=url[:200],
+                )
+                return None
+
+            # Проверяем блокировку на новом IP
+            is_blocked = await self._browser_service._check_blocked()
+            if is_blocked:
+                logger.warning(
+                    "still_blocked_after_rotation",
+                    context=context,
+                    proxy=self._browser_service.current_proxy_server,
+                )
+                # Сообщаем трекеру о бане нового прокси
+                self._browser_service.report_ban()
+                return None
+
+            # Успех — сообщаем трекеру
+            self._browser_service.report_success()
+
+            current_page = self._get_current_page()
+            if current_page is None:
+                logger.error(
+                    "no_page_after_rotation",
+                    context=context,
+                )
+                return None
+
+            logger.info(
+                "navigation_after_rotation_success",
+                context=context,
+                url=url[:200],
+                proxy=self._browser_service.current_proxy_server,
+            )
+            return current_page
+
+        except RuntimeError as e:
+            logger.error(
+                "proxy_rotation_failed",
+                context=context,
+                error=str(e),
+            )
+            return None
+
+    async def _wait_for_unblock(
+        self, page: Page, context: str, url: str = ""
+    ) -> Page | None:
+        """Ожидает снятия блокировки, при неудаче — меняет прокси.
+
+        Стратегия:
+        1. Первые MAX_BLOCK_ATTEMPTS_BEFORE_ROTATION попыток —
+           ожидание и перезагрузка на текущем IP (возможно, CAPTCHA
+           решена вручную или блокировка снята автоматически).
+        2. Если не помогло и есть прокси — ротация на следующий
+           здоровый IP. До MAX_PROXY_ROTATIONS_PER_BLOCK смен.
+        3. После каждой ротации — ещё
+           MAX_BLOCK_ATTEMPTS_BEFORE_ROTATION попыток ожидания.
 
         Args:
             page: Активная страница Playwright.
             context: Контекст вызова для логирования.
+            url: URL для навигации после ротации прокси.
+                Если пустой — используется текущий URL страницы.
 
         Returns:
-            True если блокировка снята.
+            Актуальная Page если блокировка снята, None при неудаче.
         """
-        for attempt in range(1, MAX_UNBLOCK_RETRIES + 1):
-            logger.warning(
-                "block_detected_waiting",
-                context=context,
-                attempt=attempt,
-                max_attempts=MAX_UNBLOCK_RETRIES,
-                wait_seconds=UNBLOCK_WAIT,
-            )
+        target_url = url or page.url
+        rotations_done = 0
+        current_page = page
+        total_attempt = 0
 
-            await asyncio.sleep(UNBLOCK_WAIT)
+        while True:
+            # === Фаза ожидания на текущем IP ===
+            for wait_attempt in range(
+                1, MAX_BLOCK_ATTEMPTS_BEFORE_ROTATION + 1
+            ):
+                total_attempt += 1
 
-            try:
-                current_url = page.url
-                await page.reload(wait_until="domcontentloaded")
-                logger.info(
-                    "page_reloaded_after_block",
-                    context=context,
-                    attempt=attempt,
-                    url=current_url[:200],
-                )
-            except Exception as e:
                 logger.warning(
-                    "page_reload_failed_after_block",
+                    "block_detected_waiting",
                     context=context,
-                    attempt=attempt,
-                    error=str(e),
+                    attempt=total_attempt,
+                    max_attempts=MAX_UNBLOCK_RETRIES,
+                    wait_seconds=UNBLOCK_WAIT,
+                    proxy=self._browser_service.current_proxy_server,
                 )
-                continue
 
-            await asyncio.sleep(5)
+                await asyncio.sleep(UNBLOCK_WAIT)
 
-            is_blocked = await self._browser_service._check_blocked()
-            if not is_blocked:
-                logger.info(
-                    "block_resolved",
+                try:
+                    current_url = current_page.url
+                    await current_page.reload(
+                        wait_until="domcontentloaded"
+                    )
+                    logger.info(
+                        "page_reloaded_after_block",
+                        context=context,
+                        attempt=total_attempt,
+                        url=current_url[:200],
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "page_reload_failed_after_block",
+                        context=context,
+                        attempt=total_attempt,
+                        error=str(e),
+                    )
+                    continue
+
+                await asyncio.sleep(5)
+
+                is_blocked = (
+                    await self._browser_service._check_blocked()
+                )
+                if not is_blocked:
+                    logger.info(
+                        "block_resolved",
+                        context=context,
+                        attempt=total_attempt,
+                    )
+                    # Возвращаем актуальную page
+                    return self._get_current_page() or current_page
+
+                logger.warning(
+                    "still_blocked",
                     context=context,
-                    attempt=attempt,
+                    attempt=total_attempt,
                 )
-                return True
 
-            logger.warning(
-                "still_blocked",
+            # === Фаза ротации прокси ===
+            if not self._browser_service.has_proxies:
+                logger.warning(
+                    "block_not_resolved_no_proxies",
+                    context=context,
+                    total_attempts=total_attempt,
+                )
+                print(
+                    f"  [каталог] Блокировка не снята после "
+                    f"{total_attempt} попыток. "
+                    f"Прокси не подключены — решите CAPTCHA "
+                    f"вручную или добавьте прокси."
+                )
+                return None
+
+            if rotations_done >= MAX_PROXY_ROTATIONS_PER_BLOCK:
+                logger.error(
+                    "block_max_rotations_exhausted",
+                    context=context,
+                    rotations=rotations_done,
+                    max_rotations=MAX_PROXY_ROTATIONS_PER_BLOCK,
+                    total_attempts=total_attempt,
+                )
+                print(
+                    f"  [каталог] Блокировка не снята после "
+                    f"{rotations_done} смен прокси. "
+                    f"Все попытки исчерпаны."
+                )
+                return None
+
+            rotations_done += 1
+
+            logger.info(
+                "block_rotating_proxy",
                 context=context,
-                attempt=attempt,
+                rotation=rotations_done,
+                max_rotations=MAX_PROXY_ROTATIONS_PER_BLOCK,
+                total_attempts=total_attempt,
+                alive_proxies=self._browser_service.health_tracker.alive_count,
+            )
+            print(
+                f"  [каталог] Блокировка не снята после "
+                f"{MAX_BLOCK_ATTEMPTS_BEFORE_ROTATION} ожиданий → "
+                f"смена прокси ({rotations_done}/"
+                f"{MAX_PROXY_ROTATIONS_PER_BLOCK})..."
             )
 
-        logger.error(
-            "block_not_resolved",
-            context=context,
-            max_attempts=MAX_UNBLOCK_RETRIES,
-            total_wait_seconds=MAX_UNBLOCK_RETRIES * UNBLOCK_WAIT,
-        )
-        return False
+            # Сообщаем трекеру о бане текущего прокси
+            self._browser_service.report_ban()
 
-    async def _initial_navigate_with_retry(self, page: Page) -> bool:
+            new_page = await self._rotate_and_navigate(
+                url=target_url,
+                context=context,
+            )
+
+            if new_page is not None:
+                logger.info(
+                    "block_resolved_after_rotation",
+                    context=context,
+                    rotation=rotations_done,
+                    proxy=self._browser_service.current_proxy_server,
+                )
+                return new_page
+
+            # Ротация не помогла — текущий прокси тоже забанен.
+            # Обновляем current_page (могла измениться после ротации)
+            updated_page = self._get_current_page()
+            if updated_page is not None:
+                current_page = updated_page
+
+            # Проверяем лимит общих попыток
+            if total_attempt >= MAX_UNBLOCK_RETRIES:
+                logger.error(
+                    "block_not_resolved_max_attempts",
+                    context=context,
+                    total_attempts=total_attempt,
+                    rotations=rotations_done,
+                )
+                return None
+
+            # Продолжаем цикл: снова фаза ожидания на новом IP
+
+        # Этот код недостижим, но mypy требует
+        return None  # pragma: no cover
+
+    async def _initial_navigate_with_retry(
+        self, page: Page
+    ) -> Page | None:
         """Выполняет первоначальную навигацию с ожиданием разблокировки.
+
+        При обнаружении блокировки автоматически ожидает и при
+        необходимости ротирует прокси. Возвращает актуальную
+        страницу после успешной навигации.
 
         Args:
             page: Активная страница Playwright.
 
         Returns:
-            True если навигация успешна.
+            Актуальная Page после успешной навигации, None при неудаче.
         """
         url = self._settings.category_url
 
         success = await self._browser_service.navigate(url)
         if success:
-            return True
+            return self._get_current_page() or page
 
         is_blocked = await self._browser_service._check_blocked()
         if not is_blocked:
@@ -340,25 +564,27 @@ class ScraperService:
                 "initial_navigation_failed_not_blocked",
                 url=url,
             )
-            return False
+            return None
 
         logger.warning(
             "initial_navigation_blocked",
             url=url,
         )
 
-        unblocked = await self._wait_for_unblock(
+        unblocked_page = await self._wait_for_unblock(
             page,
             context="initial_navigation",
+            url=url,
         )
-        if not unblocked:
+        if unblocked_page is None:
             logger.error(
                 "initial_navigation_block_not_resolved",
                 url=url,
-                max_attempts=MAX_UNBLOCK_RETRIES,
             )
-            return False
+            return None
 
+        # Блокировка снята (возможно, на новом прокси).
+        # Пробуем навигацию на целевой URL.
         for attempt in range(1, MAX_INITIAL_NAVIGATION_RETRIES + 1):
             logger.info(
                 "initial_navigation_retry",
@@ -373,20 +599,23 @@ class ScraperService:
                     "initial_navigation_retry_success",
                     attempt=attempt,
                 )
-                return True
+                return self._get_current_page() or unblocked_page
 
             is_blocked = await self._browser_service._check_blocked()
             if is_blocked:
-                unblocked = await self._wait_for_unblock(
-                    page,
-                    context=f"initial_navigation_retry:{attempt}",
+                unblocked_page = await self._wait_for_unblock(
+                    self._get_current_page() or unblocked_page,
+                    context=(
+                        f"initial_navigation_retry:{attempt}"
+                    ),
+                    url=url,
                 )
-                if not unblocked:
+                if unblocked_page is None:
                     logger.error(
                         "initial_navigation_permanently_blocked",
                         attempt=attempt,
                     )
-                    return False
+                    return None
             else:
                 logger.error(
                     "initial_navigation_retry_failed",
@@ -396,26 +625,29 @@ class ScraperService:
                 if attempt < MAX_INITIAL_NAVIGATION_RETRIES:
                     await asyncio.sleep(ELEMENT_RETRY_WAIT)
                     continue
-                return False
+                return None
 
         logger.error(
             "initial_navigation_all_retries_exhausted",
             max_attempts=MAX_INITIAL_NAVIGATION_RETRIES,
             url=url,
         )
-        return False
+        return None
 
     async def _check_container_after_pagination(
         self, page: Page, target_page_num: int
-    ) -> bool:
+    ) -> Page | None:
         """Проверяет наличие контейнера с объявлениями после пагинации.
+
+        При обнаружении блокировки — ожидает и при необходимости
+        ротирует прокси. Возвращает актуальную страницу.
 
         Args:
             page: Активная страница Playwright.
             target_page_num: Номер целевой страницы (для логов).
 
         Returns:
-            True если контейнер с объявлениями найден.
+            Актуальная Page если контейнер найден, None при неудаче.
         """
         try:
             await page.wait_for_selector(
@@ -427,7 +659,7 @@ class ScraperService:
                 target_page=target_page_num,
                 container=self.CATALOG_CONTAINER,
             )
-            return True
+            return self._get_current_page() or page
         except Exception:
             pass
 
@@ -437,13 +669,18 @@ class ScraperService:
                 "pagination_page_blocked",
                 target_page=target_page_num,
             )
-            unblocked = await self._wait_for_unblock(
+
+            target_url = self._build_page_url(target_page_num)
+            unblocked_page = await self._wait_for_unblock(
                 page,
-                context=f"pagination_container:page_{target_page_num}",
+                context=(
+                    f"pagination_container:page_{target_page_num}"
+                ),
+                url=target_url,
             )
-            if unblocked:
+            if unblocked_page is not None:
                 try:
-                    await page.wait_for_selector(
+                    await unblocked_page.wait_for_selector(
                         self.CATALOG_CONTAINER,
                         timeout=PAGINATION_CONTAINER_TIMEOUT,
                     )
@@ -451,18 +688,18 @@ class ScraperService:
                         "pagination_container_found_after_unblock",
                         target_page=target_page_num,
                     )
-                    return True
+                    return unblocked_page
                 except Exception:
                     pass
 
-            return False
+            return None
 
         logger.info(
             "pagination_no_more_items",
             target_page=target_page_num,
             container=self.CATALOG_CONTAINER,
         )
-        return False
+        return None
 
     async def _warmup_after_rotation(self, page: Page) -> None:
         """Прогревает новый контекст после ротации прокси.
@@ -517,13 +754,15 @@ class ScraperService:
 
         page = await self._browser_service.launch()
 
-        success = await self._initial_navigate_with_retry(page)
-        if not success:
+        result_page = await self._initial_navigate_with_retry(page)
+        if result_page is None:
             logger.error(
                 "initial_navigation_failed",
                 url=self._settings.category_url,
             )
             return []
+
+        page = result_page
 
         await self._browser_service.simulate_human_behavior()
 
@@ -686,16 +925,18 @@ class ScraperService:
                 )
                 break
 
-            has_next = await self._go_to_next_page(
+            result = await self._go_to_next_page(
                 page, current_page_num
             )
-            if not has_next:
+            if result is None:
                 logger.info(
                     "pagination_ended",
                     last_page=current_page_num,
                 )
                 break
 
+            # Обновляем page — могла измениться после ротации прокси
+            page = result
             current_page_num += 1
 
             updated_total = await self._detect_total_pages(page)
@@ -775,8 +1016,10 @@ class ScraperService:
             if self._browser_service.page is not None:
                 current_page = self._browser_service.page
 
-            # Проверяем необходимость плановой ротации прокси по счётчику
-            new_page = await self._browser_service.increment_and_check_rotation()
+            # Проверяем необходимость плановой ротации прокси
+            new_page = (
+                await self._browser_service.increment_and_check_rotation()
+            )
             if new_page is not None:
                 logger.info(
                     "proxy_rotated_by_counter",
@@ -879,8 +1122,11 @@ class ScraperService:
             True если элемент появился на странице.
         """
         for attempt in range(1, MAX_ELEMENT_RETRIES + 1):
+            # Всегда используем актуальную page
+            current_page = self._get_current_page() or page
+
             try:
-                await page.wait_for_selector(
+                await current_page.wait_for_selector(
                     selector,
                     timeout=15000,
                 )
@@ -896,11 +1142,13 @@ class ScraperService:
 
             is_blocked = await self._browser_service._check_blocked()
             if is_blocked:
-                unblocked = await self._wait_for_unblock(
-                    page,
+                target_url = current_page.url
+                unblocked_page = await self._wait_for_unblock(
+                    current_page,
                     context=f"element_wait:{element_name}",
+                    url=target_url,
                 )
-                if unblocked:
+                if unblocked_page is not None:
                     continue
                 return False
 
@@ -910,7 +1158,7 @@ class ScraperService:
                     element=element_name,
                     selector=selector,
                     attempts=MAX_ELEMENT_RETRIES,
-                    url=page.url,
+                    url=current_page.url,
                 )
                 return False
 
@@ -920,12 +1168,14 @@ class ScraperService:
                 attempt=attempt,
                 max_attempts=MAX_ELEMENT_RETRIES,
                 wait_seconds=ELEMENT_RETRY_WAIT,
-                url=page.url,
+                url=current_page.url,
             )
 
             try:
-                current_url = page.url
-                await page.reload(wait_until="domcontentloaded")
+                current_url = current_page.url
+                await current_page.reload(
+                    wait_until="domcontentloaded"
+                )
                 logger.info(
                     "page_reloaded_for_element",
                     element=element_name,
@@ -966,9 +1216,15 @@ class ScraperService:
             logger.warning("catalog_container_not_found_after_retries")
             return items
 
-        await self._scroll_page_naturally(page)
+        # Используем актуальную page (могла измениться в
+        # _wait_for_element_with_retry при ротации)
+        current_page = self._get_current_page() or page
 
-        container = await page.query_selector(self.CATALOG_CONTAINER)
+        await self._scroll_page_naturally(current_page)
+
+        container = await current_page.query_selector(
+            self.CATALOG_CONTAINER
+        )
         if not container:
             logger.warning(
                 "catalog_container_disappeared_after_scroll",
@@ -1038,7 +1294,9 @@ class ScraperService:
         price = 0
         price_meta = await card.query_selector(self.ITEM_PRICE_META)
         if price_meta:
-            price_str = await price_meta.get_attribute("content") or "0"
+            price_str = (
+                await price_meta.get_attribute("content") or "0"
+            )
             try:
                 price = int(price_str)
             except ValueError:
@@ -1066,7 +1324,9 @@ class ScraperService:
         # Извлекаем рейтинг хоста из карточки каталога
         host_rating = 0.0
         try:
-            score_el = await card.query_selector(SELLER_SCORE_SELECTOR)
+            score_el = await card.query_selector(
+                SELLER_SCORE_SELECTOR
+            )
             if score_el:
                 score_text = (await score_el.inner_text()).strip()
                 # Заменяем запятую на точку: "4,4" → "4.4"
@@ -1105,15 +1365,18 @@ class ScraperService:
 
     async def _go_to_next_page(
         self, page: Page, current_page_num: int
-    ) -> bool:
+    ) -> Page | None:
         """Переходит на следующую страницу пагинации.
+
+        При блокировке автоматически ожидает и при необходимости
+        ротирует прокси. Возвращает актуальную страницу.
 
         Args:
             page: Активная страница Playwright.
             current_page_num: Номер текущей страницы.
 
         Returns:
-            True если переход успешен.
+            Актуальная Page после успешного перехода, None при неудаче.
         """
         target_page_num = current_page_num + 1
 
@@ -1123,13 +1386,15 @@ class ScraperService:
                 "cannot_build_next_page_url",
                 target_page=target_page_num,
             )
-            return False
+            return None
 
         logger.info(
             "next_page_url_constructed",
             target_page=target_page_num,
             next_url=next_url[:200],
         )
+
+        current_page = page
 
         for attempt in range(1, MAX_PAGINATION_RETRIES + 1):
             try:
@@ -1142,7 +1407,7 @@ class ScraperService:
                 )
                 await asyncio.sleep(delay)
 
-                await page.goto(
+                await current_page.goto(
                     next_url,
                     wait_until="domcontentloaded",
                     timeout=60000,
@@ -1154,62 +1419,69 @@ class ScraperService:
                 )
                 await asyncio.sleep(ELEMENT_RETRY_WAIT)
 
-                is_blocked = await self._browser_service._check_blocked()
+                is_blocked = (
+                    await self._browser_service._check_blocked()
+                )
                 if is_blocked:
-                    unblocked = await self._wait_for_unblock(
-                        page,
-                        context=f"pagination:page_{target_page_num}",
+                    unblocked_page = await self._wait_for_unblock(
+                        current_page,
+                        context=(
+                            f"pagination:page_{target_page_num}"
+                        ),
+                        url=next_url,
                     )
-                    if not unblocked:
+                    if unblocked_page is None:
                         logger.error(
                             "next_page_permanently_blocked",
                             target_page=target_page_num,
                         )
-                        return False
+                        return None
 
-                    logger.info(
-                        "retrying_navigation_after_unblock",
-                        target_page=target_page_num,
+                    # Обновляем page — могла измениться при ротации
+                    current_page = unblocked_page
+
+                    # После разблокировки — проверяем контейнер
+                    container_page = (
+                        await self._check_container_after_pagination(
+                            current_page, target_page_num
+                        )
                     )
-                    try:
-                        await page.goto(
-                            next_url,
-                            wait_until="domcontentloaded",
-                            timeout=60000,
-                        )
-                        await asyncio.sleep(ELEMENT_RETRY_WAIT)
-                    except Exception as e:
-                        logger.warning(
-                            "navigation_after_unblock_failed",
-                            target_page=target_page_num,
-                            error=str(e),
-                        )
-                        if attempt < MAX_PAGINATION_RETRIES:
-                            continue
-                        return False
+                    if container_page is None:
+                        return None
+                    current_page = container_page
 
-                    still_blocked = (
-                        await self._browser_service._check_blocked()
+                    # Проверяем номер страницы
+                    actual_page_num = (
+                        self._extract_page_number_from_url(
+                            current_page.url
+                        )
                     )
-                    if still_blocked:
-                        logger.warning(
-                            "blocked_again_after_retry_navigation",
+                    if actual_page_num == target_page_num:
+                        logger.info(
+                            "next_page_loaded_after_unblock",
                             target_page=target_page_num,
+                            actual_page=actual_page_num,
                         )
-                        if attempt < MAX_PAGINATION_RETRIES:
-                            continue
-                        return False
+                        return current_page
 
-                container_found = (
+                    # Страница не та — повторяем
+                    if attempt < MAX_PAGINATION_RETRIES:
+                        continue
+                    return None
+
+                container_page = (
                     await self._check_container_after_pagination(
-                        page, target_page_num
+                        current_page, target_page_num
                     )
                 )
-                if not container_found:
-                    return False
+                if container_page is None:
+                    return None
+                current_page = container_page
 
-                actual_page_num = self._extract_page_number_from_url(
-                    page.url
+                actual_page_num = (
+                    self._extract_page_number_from_url(
+                        current_page.url
+                    )
                 )
 
                 if actual_page_num == target_page_num:
@@ -1217,16 +1489,16 @@ class ScraperService:
                         "next_page_loaded",
                         target_page=target_page_num,
                         actual_page=actual_page_num,
-                        url=page.url[:200],
+                        url=current_page.url[:200],
                     )
-                    return True
+                    return current_page
 
                 logger.warning(
                     "page_number_mismatch",
                     target_page=target_page_num,
                     actual_page=actual_page_num,
                     attempt=attempt,
-                    url=page.url[:200],
+                    url=current_page.url[:200],
                 )
 
                 if actual_page_num == 1:
@@ -1240,14 +1512,14 @@ class ScraperService:
                     )
                     if fallback_url:
                         try:
-                            await page.goto(
+                            await current_page.goto(
                                 fallback_url,
                                 wait_until="domcontentloaded",
                                 timeout=60000,
                             )
                         except Exception:
                             pass
-                    return False
+                    return None
 
                 if attempt < MAX_PAGINATION_RETRIES:
                     logger.info(
@@ -1257,7 +1529,7 @@ class ScraperService:
                     )
                     continue
 
-                return False
+                return None
 
             except Exception as e:
                 logger.error(
@@ -1269,8 +1541,13 @@ class ScraperService:
 
                 if attempt < MAX_PAGINATION_RETRIES:
                     await asyncio.sleep(ELEMENT_RETRY_WAIT)
+                    # Обновляем page на случай, если она
+                    # стала невалидной
+                    updated = self._get_current_page()
+                    if updated is not None:
+                        current_page = updated
                     continue
 
-                return False
+                return None
 
-        return False
+        return None
