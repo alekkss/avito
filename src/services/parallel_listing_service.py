@@ -8,6 +8,10 @@
 Все воркеры разделяют один ProxyHealthTracker — если прокси забанен
 у одного воркера, остальные об этом узнают и пропустят его при ротации.
 
+После основного раунда проваленные карточки автоматически
+перезапускаются в failover-раундах (до MAX_FAILOVER_ROUNDS попыток)
+с использованием оставшихся здоровых прокси.
+
 Паттерн Strategy: ParallelListingService заменяет последовательный
 обход карточек в ScraperService._parse_all_listings() на параллельный,
 не меняя логику парсинга отдельной карточки (ListingService).
@@ -15,7 +19,8 @@
 
 import asyncio
 import random
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 from playwright.async_api import Browser, Playwright, async_playwright
 
@@ -34,7 +39,15 @@ from src.services.proxy_health import ProxyHealthTracker
 logger = get_logger("parallel_listing_service")
 
 # Максимальное количество воркеров при автоопределении
-MAX_AUTO_WORKERS: int = 5
+MAX_AUTO_WORKERS: int = 10
+
+# Максимальное количество failover-раундов
+MAX_FAILOVER_ROUNDS: int = 3
+
+# Пауза между failover-раундами (секунды),
+# позволяет Avito «забыть» о предыдущих запросах
+FAILOVER_COOLDOWN_MIN: float = 5.0
+FAILOVER_COOLDOWN_MAX: float = 10.0
 
 # URL для «прогрева» нового контекста воркера
 WARMUP_URL: str = "https://www.avito.ru"
@@ -86,11 +99,17 @@ class WorkerResult:
         worker_id: Идентификатор воркера.
         successful: Количество успешно обработанных карточек.
         failed: Количество карточек с ошибками.
+        elapsed: Время работы воркера в секундах.
+        failed_items: Список проваленных карточек для failover.
     """
 
     worker_id: int
     successful: int
     failed: int
+    elapsed: float = 0.0
+    failed_items: list[CatalogItemForWorker] = field(
+        default_factory=list
+    )
 
 
 def _determine_worker_count(
@@ -175,6 +194,27 @@ def _distribute_proxies(
     return distribution
 
 
+def _renumber_items(
+    items: list[CatalogItemForWorker],
+) -> list[CatalogItemForWorker]:
+    """Перенумеровывает карточки для корректного отображения прогресса.
+
+    При failover-раунде карточки сохраняют старые index/total.
+    Эта функция обновляет нумерацию под новый размер списка.
+
+    Args:
+        items: Список карточек с устаревшей нумерацией.
+
+    Returns:
+        Тот же список с обновлёнными index и total.
+    """
+    total = len(items)
+    for i, item in enumerate(items, start=1):
+        item.index = i
+        item.total = total
+    return items
+
+
 class ParallelListingService:
     """Сервис параллельной обработки карточек объявлений.
 
@@ -186,6 +226,10 @@ class ParallelListingService:
     получает баны у любого воркера — трекер помечает его как DEAD,
     и все остальные воркеры автоматически пропускают его при ротации.
     Это устраняет бесполезные retry на заведомо мёртвых прокси.
+
+    После основного раунда проваленные карточки автоматически
+    перезапускаются в failover-раундах с использованием оставшихся
+    здоровых прокси (до MAX_FAILOVER_ROUNDS попыток).
 
     При отсутствии прокси или max_workers=1 — работает в один
     поток, полностью совместим с текущим поведением.
@@ -222,7 +266,8 @@ class ParallelListingService:
         Основной публичный метод. Загружает прокси, создаёт общий
         ProxyHealthTracker, определяет количество воркеров, запускает
         общий Chromium, создаёт воркеров с общим трекером и ожидает
-        завершения всех.
+        завершения всех. После основного раунда запускает failover
+        для проваленных карточек.
 
         Args:
             catalog_items: Список карточек из каталога для обработки.
@@ -234,12 +279,12 @@ class ParallelListingService:
             logger.info("parallel_processing_skipped_no_items")
             return []
 
+        process_start = time.monotonic()
+
         # --- Загружаем прокси ---
         all_proxies = self._load_all_proxies()
 
         # --- Создаём общий трекер здоровья прокси ---
-        # Один трекер на все воркеры: если прокси забанен у воркера #1,
-        # воркеры #2..N тоже пропустят его при ротации.
         shared_tracker = ProxyHealthTracker()
         shared_tracker.register_many(
             [p.server for p in all_proxies]
@@ -269,25 +314,12 @@ class ParallelListingService:
             f"для обработки {len(catalog_items)} карточек"
         )
 
-        # --- Распределяем прокси между воркерами ---
-        proxy_distribution = _distribute_proxies(
-            all_proxies, worker_count
-        )
-
-        # --- Наполняем очередь ---
-        queue: asyncio.Queue[CatalogItemForWorker | None] = asyncio.Queue()
-        for item in catalog_items:
-            await queue.put(item)
-
-        # Отравляющие пилюли: по одной на каждого воркера
-        for _ in range(worker_count):
-            await queue.put(None)
-
         # --- Запускаем общий Chromium ---
         playwright: Playwright | None = None
         browser: Browser | None = None
         all_listings: list[RawListing] = []
-        worker_browser_services: list[BrowserService] = []
+        all_worker_results: list[WorkerResult] = []
+        worker_id_counter: int = 0
 
         try:
             playwright = await async_playwright().start()
@@ -302,129 +334,137 @@ class ParallelListingService:
                 worker_count=worker_count,
             )
 
-            # --- Создаём и запускаем воркеров ---
-            results_lock = asyncio.Lock()
-            tasks: list[asyncio.Task[WorkerResult]] = []
+            # === ОСНОВНОЙ РАУНД ===
+            round_results, worker_id_counter = await self._run_round(
+                round_name="основной",
+                round_number=0,
+                items=catalog_items,
+                all_proxies=all_proxies,
+                shared_tracker=shared_tracker,
+                browser=browser,
+                all_listings=all_listings,
+                worker_count=worker_count,
+                worker_id_start=worker_id_counter,
+            )
+            all_worker_results.extend(round_results)
 
-            for worker_id in range(worker_count):
-                worker_proxies = proxy_distribution[worker_id]
+            # Собираем проваленные карточки
+            failed_items = self._collect_failed_items(round_results)
 
-                # Создаём BrowserService с общим трекером здоровья.
-                # Все воркеры видят одну и ту же статистику прокси:
-                # бан у воркера #1 → прокси помечен DEAD → воркер #3
-                # при ротации его пропустит.
-                worker_browser_service = BrowserService(
-                    settings=self._browser_settings,
-                    proxy_settings=self._proxy_settings,
-                    assigned_proxies=worker_proxies,
-                    worker_id=worker_id,
-                    health_tracker=shared_tracker,
-                )
-                worker_browser_services.append(worker_browser_service)
-
-                # Создаём ListingService для воркера
-                worker_listing_service = ListingService(
-                    browser_service=worker_browser_service,
-                )
-
-                task = asyncio.create_task(
-                    self._run_worker(
-                        worker_id=worker_id,
-                        browser=browser,
-                        browser_service=worker_browser_service,
-                        listing_service=worker_listing_service,
-                        queue=queue,
-                        all_listings=all_listings,
-                        results_lock=results_lock,
-                    ),
-                    name=f"worker_{worker_id}",
-                )
-                tasks.append(task)
-
-                # Стаггеринг: пауза между запуском воркеров,
-                # чтобы не создавать одновременные соединения
-                if worker_id < worker_count - 1:
-                    stagger = random.uniform(
-                        WORKER_STAGGER_DELAY_MIN,
-                        WORKER_STAGGER_DELAY_MAX,
-                    )
-                    logger.debug(
-                        "worker_stagger_delay",
-                        next_worker_id=worker_id + 1,
-                        delay=round(stagger, 1),
-                    )
-                    await asyncio.sleep(stagger)
-
-            # --- Ожидаем завершения всех воркеров ---
-            worker_results = await asyncio.gather(
-                *tasks, return_exceptions=True
+            self._print_round_summary(
+                round_name="Основной раунд",
+                results=round_results,
+                failed_remaining=len(failed_items),
             )
 
-            # --- Собираем статистику ---
-            total_successful = 0
-            total_failed = 0
+            # === FAILOVER-РАУНДЫ ===
+            failover_round = 0
 
-            for i, result in enumerate(worker_results):
-                if isinstance(result, Exception):
-                    logger.error(
-                        "worker_crashed",
-                        worker_id=i,
-                        error=str(result),
-                        error_type=type(result).__name__,
+            while (
+                failed_items
+                and failover_round < MAX_FAILOVER_ROUNDS
+            ):
+                failover_round += 1
+
+                # Проверяем наличие здоровых прокси
+                healthy_proxies = [
+                    p for p in all_proxies
+                    if shared_tracker.is_healthy(p.server)
+                ]
+
+                if not healthy_proxies:
+                    logger.warning(
+                        "failover_no_healthy_proxies",
+                        round=failover_round,
+                        failed_count=len(failed_items),
                     )
                     print(
-                        f"  [воркер {i}] Аварийное завершение: {result}"
+                        f"\n  ⚠️  Failover-раунд {failover_round}: "
+                        f"нет здоровых прокси. "
+                        f"Неспарсенных: {len(failed_items)}"
                     )
-                elif isinstance(result, WorkerResult):
-                    total_successful += result.successful
-                    total_failed += result.failed
-                    logger.info(
-                        "worker_finished",
-                        worker_id=result.worker_id,
-                        successful=result.successful,
-                        failed=result.failed,
-                    )
+                    break
 
-            # --- Финальный отчёт здоровья прокси ---
+                # Перенумеровываем карточки для нового раунда
+                _renumber_items(failed_items)
+
+                # Количество воркеров для failover — не более
+                # здоровых прокси и не более проваленных карточек
+                failover_worker_count = min(
+                    len(healthy_proxies),
+                    len(failed_items),
+                    MAX_AUTO_WORKERS,
+                )
+                failover_worker_count = max(failover_worker_count, 1)
+
+                logger.info(
+                    "failover_round_started",
+                    round=failover_round,
+                    failed_count=len(failed_items),
+                    healthy_proxies=len(healthy_proxies),
+                    worker_count=failover_worker_count,
+                )
+                print(
+                    f"\n  🔄 Failover-раунд {failover_round}: "
+                    f"{len(failed_items)} карточек → "
+                    f"{failover_worker_count} воркер(ов) "
+                    f"({len(healthy_proxies)} здоровых прокси)"
+                )
+
+                # Пауза перед failover — даём Avito «остыть»
+                cooldown = random.uniform(
+                    FAILOVER_COOLDOWN_MIN, FAILOVER_COOLDOWN_MAX
+                )
+                logger.info(
+                    "failover_cooldown",
+                    round=failover_round,
+                    delay=round(cooldown, 1),
+                )
+                await asyncio.sleep(cooldown)
+
+                # Запускаем failover-раунд
+                round_results, worker_id_counter = (
+                    await self._run_round(
+                        round_name=f"failover_{failover_round}",
+                        round_number=failover_round,
+                        items=failed_items,
+                        all_proxies=healthy_proxies,
+                        shared_tracker=shared_tracker,
+                        browser=browser,
+                        all_listings=all_listings,
+                        worker_count=failover_worker_count,
+                        worker_id_start=worker_id_counter,
+                    )
+                )
+                all_worker_results.extend(round_results)
+
+                # Собираем оставшиеся проваленные
+                failed_items = self._collect_failed_items(
+                    round_results
+                )
+
+                self._print_round_summary(
+                    round_name=f"Failover-раунд {failover_round}",
+                    results=round_results,
+                    failed_remaining=len(failed_items),
+                )
+
+            # === ФИНАЛЬНАЯ СТАТИСТИКА ===
+            process_elapsed = time.monotonic() - process_start
+
             shared_tracker.log_summary()
 
-            logger.info(
-                "parallel_processing_completed",
-                total_items=len(catalog_items),
-                total_successful=total_successful,
-                total_failed=total_failed,
+            self._log_final_stats(
+                catalog_items=catalog_items,
+                all_worker_results=all_worker_results,
+                failed_items=failed_items,
+                shared_tracker=shared_tracker,
                 worker_count=worker_count,
-                proxies_alive=shared_tracker.alive_count,
-                proxies_dead=(
-                    shared_tracker.total_count
-                    - shared_tracker.alive_count
-                ),
-            )
-            print(
-                f"\n  [параллелизация] Завершено: "
-                f"{total_successful} успешно, "
-                f"{total_failed} с ошибками "
-                f"(из {len(catalog_items)} карточек)"
-            )
-            print(
-                f"  [прокси-здоровье] Живых: "
-                f"{shared_tracker.alive_count}/"
-                f"{shared_tracker.total_count}, "
-                f"исключённых: "
-                f"{shared_tracker.total_count - shared_tracker.alive_count}"
+                failover_rounds=failover_round,
+                total_elapsed=process_elapsed,
             )
 
         finally:
-            # --- Закрываем все воркерные контексты ---
-            for ws in worker_browser_services:
-                try:
-                    await ws.close()
-                except Exception as e:
-                    logger.warning(
-                        "worker_browser_close_error",
-                        error=str(e),
-                    )
-
             # --- Закрываем общий браузер ---
             if browser is not None:
                 try:
@@ -447,6 +487,151 @@ class ParallelListingService:
             logger.info("parallel_resources_closed")
 
         return all_listings
+
+    async def _run_round(
+        self,
+        round_name: str,
+        round_number: int,
+        items: list[CatalogItemForWorker],
+        all_proxies: list[ProxyInfo],
+        shared_tracker: ProxyHealthTracker,
+        browser: Browser,
+        all_listings: list[RawListing],
+        worker_count: int,
+        worker_id_start: int,
+    ) -> tuple[list[WorkerResult], int]:
+        """Запускает один раунд параллельной обработки.
+
+        Создаёт воркеров, распределяет прокси, наполняет очередь
+        и ожидает завершения. Используется как для основного раунда,
+        так и для failover-раундов.
+
+        Args:
+            round_name: Название раунда для логов.
+            round_number: Номер раунда (0 = основной).
+            items: Карточки для обработки.
+            all_proxies: Доступные прокси для этого раунда.
+            shared_tracker: Общий трекер здоровья прокси.
+            browser: Общий Browser-инстанс.
+            all_listings: Общий список результатов.
+            worker_count: Количество воркеров.
+            worker_id_start: Начальный ID для нумерации воркеров.
+
+        Returns:
+            Кортеж (список WorkerResult, следующий свободный worker_id).
+        """
+        # --- Распределяем прокси ---
+        proxy_distribution = _distribute_proxies(
+            all_proxies, worker_count
+        )
+
+        # --- Наполняем очередь ---
+        queue: asyncio.Queue[CatalogItemForWorker | None] = (
+            asyncio.Queue()
+        )
+        for item in items:
+            await queue.put(item)
+
+        for _ in range(worker_count):
+            await queue.put(None)
+
+        # --- Создаём и запускаем воркеров ---
+        results_lock = asyncio.Lock()
+        tasks: list[asyncio.Task[WorkerResult]] = []
+        worker_browser_services: list[BrowserService] = []
+
+        for i in range(worker_count):
+            worker_id = worker_id_start + i
+            worker_proxies = proxy_distribution[i]
+
+            worker_browser_service = BrowserService(
+                settings=self._browser_settings,
+                proxy_settings=self._proxy_settings,
+                assigned_proxies=worker_proxies,
+                worker_id=worker_id,
+                health_tracker=shared_tracker,
+            )
+            worker_browser_services.append(worker_browser_service)
+
+            worker_listing_service = ListingService(
+                browser_service=worker_browser_service,
+            )
+
+            task = asyncio.create_task(
+                self._run_worker(
+                    worker_id=worker_id,
+                    browser=browser,
+                    browser_service=worker_browser_service,
+                    listing_service=worker_listing_service,
+                    queue=queue,
+                    all_listings=all_listings,
+                    results_lock=results_lock,
+                ),
+                name=f"worker_{worker_id}",
+            )
+            tasks.append(task)
+
+            # Стаггеринг между запуском воркеров
+            if i < worker_count - 1:
+                stagger = random.uniform(
+                    WORKER_STAGGER_DELAY_MIN,
+                    WORKER_STAGGER_DELAY_MAX,
+                )
+                logger.debug(
+                    "worker_stagger_delay",
+                    round=round_name,
+                    next_worker_id=worker_id + 1,
+                    delay=round(stagger, 1),
+                )
+                await asyncio.sleep(stagger)
+
+        # --- Ожидаем завершения ---
+        raw_results = await asyncio.gather(
+            *tasks, return_exceptions=True
+        )
+
+        # --- Закрываем контексты воркеров этого раунда ---
+        for ws in worker_browser_services:
+            try:
+                await ws.close()
+            except Exception as e:
+                logger.warning(
+                    "worker_browser_close_error",
+                    round=round_name,
+                    error=str(e),
+                )
+
+        # --- Собираем результаты ---
+        round_results: list[WorkerResult] = []
+
+        for i, result in enumerate(raw_results):
+            actual_worker_id = worker_id_start + i
+
+            if isinstance(result, Exception):
+                logger.error(
+                    "worker_crashed",
+                    round=round_name,
+                    worker_id=actual_worker_id,
+                    error=str(result),
+                    error_type=type(result).__name__,
+                )
+                print(
+                    f"  [воркер {actual_worker_id}] "
+                    f"Аварийное завершение: {result}"
+                )
+            elif isinstance(result, WorkerResult):
+                round_results.append(result)
+                logger.info(
+                    "worker_finished",
+                    round=round_name,
+                    worker_id=result.worker_id,
+                    successful=result.successful,
+                    failed=result.failed,
+                    elapsed=round(result.elapsed, 1),
+                )
+
+        next_worker_id = worker_id_start + worker_count
+        return round_results, next_worker_id
 
     async def _run_worker(
         self,
@@ -479,7 +664,9 @@ class ParallelListingService:
         """
         successful = 0
         failed = 0
+        failed_items: list[CatalogItemForWorker] = []
         prefix = f"worker_{worker_id}"
+        worker_start = time.monotonic()
 
         try:
             # --- Инициализация контекста ---
@@ -531,7 +718,9 @@ class ParallelListingService:
 
                     if listing is not None:
                         # Сохраняем в БД (потокобезопасно)
-                        await self._repository.save_listing_async(listing)
+                        await self._repository.save_listing_async(
+                            listing
+                        )
 
                         # Добавляем в общий список результатов
                         async with results_lock:
@@ -548,6 +737,7 @@ class ParallelListingService:
                         )
                     else:
                         failed += 1
+                        failed_items.append(item)
                         logger.warning(
                             "worker_card_parse_failed",
                             worker_id=worker_id,
@@ -557,6 +747,7 @@ class ParallelListingService:
 
                 except Exception as e:
                     failed += 1
+                    failed_items.append(item)
                     logger.error(
                         "worker_card_error",
                         worker_id=worker_id,
@@ -613,21 +804,26 @@ class ParallelListingService:
                 f"  [{prefix}] Критическая ошибка: {e}"
             )
 
+        worker_elapsed = time.monotonic() - worker_start
+
         logger.info(
             "worker_completed",
             worker_id=worker_id,
             successful=successful,
             failed=failed,
+            elapsed=round(worker_elapsed, 1),
         )
         print(
-            f"  [{prefix}] Завершён: {successful} успешно, "
-            f"{failed} с ошибками"
+            f"  [{prefix}] Завершён за {worker_elapsed:.1f} сек: "
+            f"{successful} успешно, {failed} с ошибками"
         )
 
         return WorkerResult(
             worker_id=worker_id,
             successful=successful,
             failed=failed,
+            elapsed=worker_elapsed,
+            failed_items=failed_items,
         )
 
     async def _warmup_worker(
@@ -698,3 +894,199 @@ class ParallelListingService:
                 error=str(e),
             )
             return []
+
+    @staticmethod
+    def _collect_failed_items(
+        results: list[WorkerResult],
+    ) -> list[CatalogItemForWorker]:
+        """Собирает проваленные карточки из результатов всех воркеров.
+
+        Args:
+            results: Список результатов воркеров.
+
+        Returns:
+            Объединённый список проваленных карточек.
+        """
+        failed: list[CatalogItemForWorker] = []
+        for result in results:
+            failed.extend(result.failed_items)
+        return failed
+
+    @staticmethod
+    def _print_round_summary(
+        round_name: str,
+        results: list[WorkerResult],
+        failed_remaining: int,
+    ) -> None:
+        """Печатает сводку по результатам раунда.
+
+        Args:
+            round_name: Название раунда для вывода.
+            results: Результаты воркеров раунда.
+            failed_remaining: Количество оставшихся проваленных.
+        """
+        total_ok = sum(r.successful for r in results)
+        total_fail = sum(r.failed for r in results)
+        status = "✅" if total_fail == 0 else "⚠️ "
+
+        print(
+            f"\n  {status} {round_name}: "
+            f"✅ {total_ok} успешно | ❌ {total_fail} провалено"
+        )
+
+        if failed_remaining > 0:
+            print(
+                f"     Осталось для failover: {failed_remaining}"
+            )
+
+    def _log_final_stats(
+        self,
+        catalog_items: list[CatalogItemForWorker],
+        all_worker_results: list[WorkerResult],
+        failed_items: list[CatalogItemForWorker],
+        shared_tracker: ProxyHealthTracker,
+        worker_count: int,
+        failover_rounds: int,
+        total_elapsed: float,
+    ) -> None:
+        """Логирует и выводит финальную статистику.
+
+        Выводит подробный отчёт: общее время, время по воркерам,
+        среднее на карточку, количество failover-раундов,
+        состояние прокси.
+
+        Args:
+            catalog_items: Исходный список карточек.
+            all_worker_results: Результаты всех воркеров (вкл. failover).
+            failed_items: Оставшиеся необработанные карточки.
+            shared_tracker: Трекер здоровья прокси.
+            worker_count: Количество воркеров основного раунда.
+            failover_rounds: Количество failover-раундов.
+            total_elapsed: Общее время обработки в секундах.
+        """
+        total_successful = sum(
+            r.successful for r in all_worker_results
+        )
+        total_failed = len(failed_items)
+
+        # --- Статистика по воркерам ---
+        worker_timings: dict[str, float] = {}
+        for wr in all_worker_results:
+            worker_timings[f"worker_{wr.worker_id}"] = round(
+                wr.elapsed, 1
+            )
+
+        # Среднее время на карточку
+        total_cards_processed = sum(
+            r.successful + r.failed for r in all_worker_results
+        )
+        avg_per_card = (
+            total_elapsed / total_cards_processed
+            if total_cards_processed > 0
+            else 0.0
+        )
+
+        # Логируем в JSON
+        logger.info(
+            "parallel_processing_completed",
+            total_items=len(catalog_items),
+            total_successful=total_successful,
+            total_failed=total_failed,
+            worker_count=worker_count,
+            failover_rounds=failover_rounds,
+            total_elapsed=round(total_elapsed, 1),
+            avg_per_card=round(avg_per_card, 1),
+            proxies_alive=shared_tracker.alive_count,
+            proxies_dead=(
+                shared_tracker.total_count
+                - shared_tracker.alive_count
+            ),
+            worker_timings=worker_timings,
+        )
+
+        # --- Консольный вывод ---
+        print(
+            f"\n  {'═' * 61}"
+            f"\n  ИТОГИ ПАРАЛЛЕЛЬНОЙ ОБРАБОТКИ"
+            f"\n  {'═' * 61}"
+            f"\n  Всего карточек:            "
+            f"{len(catalog_items)}"
+            f"\n  Успешно спарсено:          "
+            f"{total_successful}"
+            f"\n  Не удалось спарсить:       "
+            f"{total_failed}"
+            f"\n  Воркеров (основной раунд): "
+            f"{worker_count}"
+            f"\n  Failover-раундов:          "
+            f"{failover_rounds}"
+            f"\n  Общее время:               "
+            f"{total_elapsed:.1f} сек "
+            f"({total_elapsed / 60:.1f} мин)"
+            f"\n  Среднее на карточку:       "
+            f"{avg_per_card:.1f} сек"
+            f"\n  Прокси живых/всего:        "
+            f"{shared_tracker.alive_count}/"
+            f"{shared_tracker.total_count}"
+        )
+
+        # Таблица воркеров
+        if all_worker_results:
+            print(f"\n  {'─' * 61}")
+            print("  ВРЕМЯ ВЫПОЛНЕНИЯ ВОРКЕРОВ")
+            print(f"  {'─' * 61}")
+
+            sorted_results = sorted(
+                all_worker_results, key=lambda r: r.worker_id
+            )
+
+            for wr in sorted_results:
+                cards_total = wr.successful + wr.failed
+                wr_avg = (
+                    wr.elapsed / cards_total
+                    if cards_total > 0
+                    else 0.0
+                )
+                status_icon = "✅" if not wr.failed_items else "⚠️ "
+
+                print(
+                    f"    {status_icon} worker_{wr.worker_id:>2}: "
+                    f"{wr.elapsed:>7.1f} сек "
+                    f"| {wr.successful:>3} ✅ "
+                    f"{wr.failed:>3} ❌ "
+                    f"| ~{wr_avg:.1f} сек/карточка"
+                )
+
+            # Сводная статистика по времени воркеров
+            elapsed_list = [
+                wr.elapsed for wr in all_worker_results
+            ]
+            if elapsed_list:
+                print(f"\n  {'─' * 61}")
+                print(
+                    f"  Мин. время воркера:        "
+                    f"{min(elapsed_list):.1f} сек"
+                )
+                print(
+                    f"  Макс. время воркера:       "
+                    f"{max(elapsed_list):.1f} сек"
+                )
+                print(
+                    f"  Разброс:                   "
+                    f"{max(elapsed_list) - min(elapsed_list):.1f} сек"
+                )
+
+        # Неспарсенные карточки
+        if failed_items:
+            failed_ids = [item.external_id for item in failed_items]
+            print(
+                f"\n  ⚠️  Неспарсенные карточки "
+                f"({len(failed_items)}): "
+                f"{', '.join(failed_ids[:20])}"
+            )
+            if len(failed_ids) > 20:
+                print(
+                    f"     ... и ещё "
+                    f"{len(failed_ids) - 20}"
+                )
+
+        print(f"  {'═' * 61}\n")

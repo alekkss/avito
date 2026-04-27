@@ -11,6 +11,7 @@
 
 import asyncio
 import sys
+import time
 
 from src.config import (
     ConfigValidationError,
@@ -189,22 +190,34 @@ def convert_catalog_items(
 async def run_pipeline(settings: Settings) -> None:
     """Запускает полный конвейер обработки данных.
 
-    Последовательно выполняет три этапа:
+    Последовательно выполняет три этапа с замером времени:
     1. Обход каталога Avito (последовательно, один браузер).
     2. Параллельный парсинг карточек (N воркеров с разными прокси).
     3. Экспорт результатов в Excel.
 
+    В конце выводит итоговую сводку по времени и результатам.
     Гарантирует корректное закрытие всех ресурсов
     через блоки try/finally.
 
     Args:
         settings: Полностью валидированные настройки приложения.
     """
+    pipeline_start = time.monotonic()
+    catalog_elapsed: float = 0.0
+    parsing_elapsed: float = 0.0
+    export_elapsed: float = 0.0
+    catalog_count: int = 0
+    listings_successful: int = 0
+    listings_in_db: int = 0
+    export_path_result: str | None = None
+
     repository = create_repository(settings)
     browser_service = create_browser_service(settings)
 
     try:
         # === ЭТАП 1: Обход каталога ===
+        stage_start = time.monotonic()
+
         logger.info(
             "stage_started",
             stage="catalog",
@@ -224,11 +237,14 @@ async def run_pipeline(settings: Settings) -> None:
         )
 
         catalog_items = await scraper_service.scrape_catalog()
+        catalog_elapsed = time.monotonic() - stage_start
+        catalog_count = len(catalog_items)
 
         logger.info(
             "stage_completed",
             stage="catalog",
-            catalog_items=len(catalog_items),
+            catalog_items=catalog_count,
+            elapsed=round(catalog_elapsed, 1),
         )
 
         if not catalog_items:
@@ -244,10 +260,12 @@ async def run_pipeline(settings: Settings) -> None:
         logger.info("catalog_browser_closed")
 
         # === ЭТАП 2: Параллельный парсинг карточек ===
+        stage_start = time.monotonic()
+
         logger.info(
             "stage_started",
             stage="parallel_parsing",
-            total_items=len(catalog_items),
+            total_items=catalog_count,
             max_workers=settings.proxy.max_workers,
             proxy_enabled=bool(settings.proxy.proxy_file_path),
             rotate_every=settings.proxy.rotate_every_n,
@@ -261,16 +279,21 @@ async def run_pipeline(settings: Settings) -> None:
         )
 
         listings = await parallel_service.process_all(worker_items)
+        parsing_elapsed = time.monotonic() - stage_start
+        listings_successful = len(listings)
 
-        listings_count = repository.get_listings_count()
+        listings_in_db = repository.get_listings_count()
         logger.info(
             "stage_completed",
             stage="parallel_parsing",
-            new_listings=len(listings),
-            total_in_db=listings_count,
+            new_listings=listings_successful,
+            total_in_db=listings_in_db,
+            elapsed=round(parsing_elapsed, 1),
         )
 
         # === ЭТАП 3: Экспорт в Excel ===
+        stage_start = time.monotonic()
+
         logger.info("stage_started", stage="export")
 
         export_service = create_export_service(
@@ -278,13 +301,15 @@ async def run_pipeline(settings: Settings) -> None:
             settings=settings,
         )
 
-        export_path = export_service.export()
+        export_path_result = export_service.export()
+        export_elapsed = time.monotonic() - stage_start
 
-        if export_path:
+        if export_path_result:
             logger.info(
                 "stage_completed",
                 stage="export",
-                file_path=export_path,
+                file_path=export_path_result,
+                elapsed=round(export_elapsed, 1),
             )
         else:
             logger.warning(
@@ -298,6 +323,50 @@ async def run_pipeline(settings: Settings) -> None:
         await browser_service.close()
         repository.close()
         logger.info("all_resources_closed")
+
+    # === ИТОГОВАЯ СВОДКА ===
+    pipeline_elapsed = time.monotonic() - pipeline_start
+
+    logger.info(
+        "pipeline_summary",
+        total_elapsed=round(pipeline_elapsed, 1),
+        catalog_elapsed=round(catalog_elapsed, 1),
+        parsing_elapsed=round(parsing_elapsed, 1),
+        export_elapsed=round(export_elapsed, 1),
+        catalog_items=catalog_count,
+        listings_successful=listings_successful,
+        total_in_db=listings_in_db,
+    )
+
+    print(
+        f"\n{'═' * 65}"
+        f"\n  ИТОГИ ЗАПУСКА"
+        f"\n{'═' * 65}"
+        f"\n  Этап 1 — Каталог:          "
+        f"{catalog_elapsed:>7.1f} сек "
+        f"({catalog_elapsed / 60:.1f} мин) "
+        f"| {catalog_count} объявлений"
+        f"\n  Этап 2 — Парсинг карточек: "
+        f"{parsing_elapsed:>7.1f} сек "
+        f"({parsing_elapsed / 60:.1f} мин) "
+        f"| {listings_successful} успешно"
+        f"\n  Этап 3 — Экспорт Excel:    "
+        f"{export_elapsed:>7.1f} сек"
+        f"\n{'─' * 65}"
+        f"\n  Общее время:               "
+        f"{pipeline_elapsed:>7.1f} сек "
+        f"({pipeline_elapsed / 60:.1f} мин)"
+        f"\n  Всего в базе данных:       "
+        f"{listings_in_db} объявлений"
+    )
+
+    if export_path_result:
+        print(
+            f"  Excel-файл:                "
+            f"{export_path_result}"
+        )
+
+    print(f"{'═' * 65}\n")
 
 
 def main() -> None:
@@ -320,6 +389,7 @@ def main() -> None:
     )
 
     trace_id = set_trace_id()
+    app_start = time.monotonic()
 
     logger.info(
         "application_started",
@@ -346,7 +416,13 @@ def main() -> None:
         print(f"\nКритическая ошибка: {e}")
         sys.exit(1)
 
-    logger.info("application_finished", trace_id=trace_id)
+    total_app_elapsed = time.monotonic() - app_start
+
+    logger.info(
+        "application_finished",
+        trace_id=trace_id,
+        total_elapsed=round(total_app_elapsed, 1),
+    )
 
 
 if __name__ == "__main__":

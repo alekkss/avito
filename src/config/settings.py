@@ -11,16 +11,41 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Корень проекта — два уровня вверх от этого файла (src/config/settings.py)
+PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent.parent
+
 
 def _load_env() -> None:
     """Загружает переменные окружения из .env файла.
 
-    Ищет .env файл в корне проекта (два уровня вверх от этого модуля).
+    Ищет .env файл в корне проекта.
     Если файл не найден, переменные берутся из системного окружения.
     """
-    project_root = Path(__file__).resolve().parent.parent.parent
-    env_path = project_root / ".env"
+    env_path = PROJECT_ROOT / ".env"
     load_dotenv(dotenv_path=env_path)
+
+
+def _resolve_path(raw_path: str) -> str:
+    """Преобразует относительный путь в абсолютный относительно корня проекта.
+
+    Если путь уже абсолютный — возвращает как есть.
+    Если путь пустой — возвращает пустую строку.
+    Это гарантирует, что файлы (БД, логи, Excel, прокси) всегда
+    создаются внутри папки проекта, независимо от рабочей директории
+    процесса (cwd).
+
+    Args:
+        raw_path: Исходный путь из переменной окружения.
+
+    Returns:
+        Абсолютный путь в виде строки.
+    """
+    if not raw_path:
+        return raw_path
+    path = Path(raw_path)
+    if path.is_absolute():
+        return raw_path
+    return str(PROJECT_ROOT / path)
 
 
 class ConfigValidationError(Exception):
@@ -262,7 +287,7 @@ def _validate_proxy_file(path: str) -> str:
     """Проверяет существование файла прокси, если путь указан.
 
     Args:
-        path: Путь к файлу прокси.
+        path: Путь к файлу прокси (уже разрешённый в абсолютный).
 
     Returns:
         Валидированный путь к файлу.
@@ -294,6 +319,11 @@ def load_settings() -> Settings:
 
     Читает переменные окружения из .env файла, проверяет обязательные
     параметры, парсит типы и возвращает иммутабельный объект Settings.
+
+    Все относительные пути (DB_PATH, EXPORT_PATH, LOG_FILE_PATH,
+    PROXY_FILE_PATH) разрешаются относительно корня проекта,
+    чтобы файлы создавались в правильном месте независимо
+    от рабочей директории процесса.
 
     Returns:
         Полностью валидированный объект Settings.
@@ -349,15 +379,19 @@ def load_settings() -> Settings:
         errors.append(str(e))
         max_pages = 0
 
-    # --- База данных ---
-    db_path = os.getenv("DB_PATH", "data/avito_listings.db")
+    # --- База данных (относительный путь → абсолютный от корня проекта) ---
+    db_path = _resolve_path(os.getenv("DB_PATH", "data/avito_listings.db"))
 
-    # --- Экспорт ---
-    export_path = os.getenv("EXPORT_PATH", "data/avito_report.xlsx")
+    # --- Экспорт (относительный путь → абсолютный от корня проекта) ---
+    export_path = _resolve_path(
+        os.getenv("EXPORT_PATH", "data/avito_report.xlsx")
+    )
 
-    # --- Логирование ---
+    # --- Логирование (относительный путь → абсолютный от корня проекта) ---
     log_level_raw = os.getenv("LOG_LEVEL", "INFO")
-    log_file_path = os.getenv("LOG_FILE_PATH", "logs/app.log")
+    log_file_path = _resolve_path(
+        os.getenv("LOG_FILE_PATH", "logs/app.log")
+    )
 
     try:
         log_level = _validate_log_level(log_level_raw)
@@ -365,8 +399,10 @@ def load_settings() -> Settings:
         errors.append(str(e))
         log_level = "INFO"
 
-    # --- Прокси ---
-    proxy_file_path_raw = os.getenv("PROXY_FILE_PATH", "")
+    # --- Прокси (относительный путь → абсолютный от корня проекта) ---
+    proxy_file_path_raw = _resolve_path(
+        os.getenv("PROXY_FILE_PATH", "")
+    )
     rotate_every_n_raw = os.getenv("ROTATE_EVERY_N_LISTINGS", "70")
     max_workers_raw = os.getenv("MAX_WORKERS", "0")
 
