@@ -369,7 +369,7 @@ class ParallelListingService:
                 # Проверяем наличие здоровых прокси
                 healthy_proxies = [
                     p for p in all_proxies
-                    if shared_tracker.is_healthy(p.server)
+                    if not shared_tracker.is_dead(p.server)
                 ]
 
                 if not healthy_proxies:
