@@ -15,6 +15,12 @@
 попыток). Это устраняет основную причину потери карточек:
 бессмысленные retry на забаненном прокси.
 
+КЛЮЧЕВОЕ ИЗМЕНЕНИЕ (v2): при ошибке «Target page, context or
+browser has been closed» — пересоздаёт контекст через
+BrowserService.recreate_context() вместо бесполезной ротации.
+Это устраняет каскад ошибок навигации на мёртвом контексте,
+когда воркер терял ВСЕ последующие карточки после первого обрыва.
+
 Паттерн Strategy: при переходе на другую площадку (Суточно.ру)
 можно создать альтернативную реализацию с тем же интерфейсом.
 """
@@ -30,7 +36,10 @@ from playwright.async_api import Page
 
 from src.config import get_logger
 from src.models import RawListing, RoomCategory
-from src.services.browser_service import BrowserService
+from src.services.browser_service import (
+    BrowserService,
+    _is_context_dead_error,
+)
 
 logger = get_logger("listing_service")
 
@@ -74,6 +83,11 @@ MAX_CALENDAR_RELOAD_RETRIES: int = 3
 
 # Ожидание перед перезагрузкой страницы при отсутствии календаря (секунды)
 CALENDAR_RELOAD_WAIT_SECONDS: int = 10
+
+# Максимальное количество попыток пересоздания контекста при
+# ошибке «Target page, context or browser has been closed».
+# После этого количества попыток — переходим к ротации прокси.
+MAX_CONTEXT_RECREATE_RETRIES: int = 2
 
 # Маппинг текстовых описаний категорий на enum
 ROOM_CATEGORY_MAP: dict[str, RoomCategory] = {
@@ -246,6 +260,11 @@ class ListingService:
     отличие от предыдущей версии, где карточка терялась при первом
     же провале datepicker.
 
+    КЛЮЧЕВОЕ ИЗМЕНЕНИЕ (v2): при ошибке «Target page, context or
+    browser has been closed» — вызывает recreate_context() для
+    восстановления контекста вместо бесполезной ротации на мёртвой
+    page. Это устраняет каскад потери всех последующих карточек.
+
     Attributes:
         _browser_service: Сервис управления браузером.
     """
@@ -283,6 +302,10 @@ class ListingService:
         - Все ротации прокси исчерпаны.
         - Или нет здоровых прокси в пуле.
 
+        ИЗМЕНЕНИЕ (v2): перед каждой итерацией проверяет, жив ли
+        контекст. При мёртвом контексте — пересоздаёт его через
+        recreate_context(), не тратя попытку ротации прокси.
+
         Args:
             page: Активная страница Playwright.
             external_id: Идентификатор объявления (формат "av_<id>").
@@ -312,6 +335,34 @@ class ListingService:
         for attempt in range(max_attempts):
             is_retry_after_rotation = attempt > 0
 
+            # === ИЗМЕНЕНИЕ (v2): проверяем живость контекста ===
+            # Если контекст мёртв (обрыв соединения на предыдущей
+            # карточке или внутри цикла) — пересоздаём его.
+            # Это НЕ считается попыткой ротации — не тратим attempt.
+            if not self._browser_service.is_context_alive:
+                logger.warning(
+                    "context_dead_before_attempt",
+                    external_id=external_id,
+                    attempt=attempt,
+                )
+                try:
+                    new_page = await self._browser_service.recreate_context()
+                    page = new_page
+                    logger.info(
+                        "context_recreated_before_attempt",
+                        external_id=external_id,
+                        attempt=attempt,
+                        proxy=self._browser_service.current_proxy_server,
+                    )
+                except RuntimeError as e:
+                    logger.error(
+                        "context_recreate_failed",
+                        external_id=external_id,
+                        attempt=attempt,
+                        error=str(e),
+                    )
+                    return None
+
             if is_retry_after_rotation:
                 # Ротируем прокси перед повторной попыткой
                 if not self._browser_service.has_proxies:
@@ -319,7 +370,7 @@ class ListingService:
                         "calendar_retry_no_proxies",
                         external_id=external_id,
                         attempt=attempt,
-                        reason="нет здоровых прокси в пуле",
+                        reason="нет здоровых прокси в подпуле",
                     )
                     return None
 
@@ -1063,6 +1114,11 @@ class ListingService:
         о бане текущего прокси и пытается дождаться разблокировки
         стандартным retry-механизмом (5 попыток).
 
+        ИЗМЕНЕНИЕ (v2): при ошибке «Target page, context or browser
+        has been closed» — пересоздаёт контекст через
+        recreate_context() и повторяет навигацию. Это устраняет
+        каскад ошибок на мёртвом контексте.
+
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
@@ -1089,11 +1145,30 @@ class ListingService:
             )
             await asyncio.sleep(random.uniform(3.0, 5.0))
         except Exception as e:
+            error_text = str(e)
+
+            # === ИЗМЕНЕНИЕ (v2): обработка разрушенного контекста ===
+            if _is_context_dead_error(error_text):
+                logger.warning(
+                    "listing_navigation_context_dead",
+                    external_id=external_id,
+                    url=full_url[:200],
+                    error=error_text[:150],
+                )
+
+                # Пытаемся пересоздать контекст и повторить навигацию
+                recreated_page = await self._handle_dead_context(
+                    external_id, full_url
+                )
+                if recreated_page is not None:
+                    return True
+                return False
+
             logger.warning(
                 "listing_navigation_failed",
                 external_id=external_id,
                 url=full_url[:200],
-                error=str(e),
+                error=error_text[:200],
             )
             return False
 
@@ -1113,6 +1188,124 @@ class ListingService:
         self._browser_service.report_success()
         return True
 
+    async def _handle_dead_context(
+        self,
+        external_id: str,
+        full_url: str,
+    ) -> Page | None:
+        """Обрабатывает ошибку разрушенного контекста.
+
+        Пересоздаёт BrowserContext через recreate_context() и
+        повторяет навигацию на карточку. Если пересоздание не
+        помогает (прокси мёртв) — возвращает None для перехода
+        к ротации прокси.
+
+        КЛЮЧЕВОЕ ОТЛИЧИЕ от rotate_proxy(): recreate_context()
+        использует тот же прокси (если он ещё жив в трекере).
+        Это быстрее и экономит здоровые прокси — проблема может
+        быть временным обрывом соединения, а не баном.
+
+        Args:
+            external_id: ID объявления для логирования.
+            full_url: Полный URL карточки для повторной навигации.
+
+        Returns:
+            Новая Page с загруженной карточкой, или None при провале.
+        """
+        for recreate_attempt in range(
+            1, MAX_CONTEXT_RECREATE_RETRIES + 1
+        ):
+            logger.info(
+                "context_dead_recreating",
+                external_id=external_id,
+                attempt=recreate_attempt,
+                max_attempts=MAX_CONTEXT_RECREATE_RETRIES,
+                proxy=self._browser_service.current_proxy_server,
+            )
+            print(
+                f"  [контекст] Контекст разрушен для {external_id}. "
+                f"Пересоздание (попытка {recreate_attempt}/"
+                f"{MAX_CONTEXT_RECREATE_RETRIES})..."
+            )
+
+            try:
+                new_page = await self._browser_service.recreate_context()
+            except RuntimeError as e:
+                logger.error(
+                    "context_recreate_failed",
+                    external_id=external_id,
+                    attempt=recreate_attempt,
+                    error=str(e),
+                )
+                return None
+
+            # Пробуем навигацию на новой page
+            try:
+                await new_page.goto(
+                    full_url,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+                await asyncio.sleep(random.uniform(3.0, 5.0))
+            except Exception as nav_error:
+                nav_error_text = str(nav_error)
+
+                if _is_context_dead_error(nav_error_text):
+                    # Контекст снова умер — прокси скорее всего мёртв
+                    logger.warning(
+                        "context_dead_again_after_recreate",
+                        external_id=external_id,
+                        attempt=recreate_attempt,
+                        error=nav_error_text[:150],
+                    )
+                    # Сообщаем трекеру об ошибке соединения
+                    if self._browser_service.current_proxy_server:
+                        self._browser_service._health_tracker.report_connection_error(
+                            self._browser_service.current_proxy_server
+                        )
+                    continue
+
+                logger.warning(
+                    "navigation_failed_after_recreate",
+                    external_id=external_id,
+                    attempt=recreate_attempt,
+                    error=nav_error_text[:200],
+                )
+                return None
+
+            # Проверяем блокировку
+            is_blocked = await self._browser_service._check_blocked()
+            if is_blocked:
+                self._browser_service.report_ban()
+                logger.warning(
+                    "blocked_after_context_recreate",
+                    external_id=external_id,
+                    attempt=recreate_attempt,
+                )
+                return None
+
+            # Успех!
+            self._browser_service.report_success()
+            logger.info(
+                "context_recreated_navigation_success",
+                external_id=external_id,
+                attempt=recreate_attempt,
+                proxy=self._browser_service.current_proxy_server,
+            )
+            print(
+                f"  [контекст] Контекст пересоздан, "
+                f"карточка {external_id} загружена."
+            )
+            return new_page
+
+        # Все попытки пересоздания исчерпаны
+        logger.warning(
+            "context_recreate_all_attempts_failed",
+            external_id=external_id,
+            max_attempts=MAX_CONTEXT_RECREATE_RETRIES,
+        )
+        return None
+
     async def _retry_with_proxy_rotation(
         self,
         external_id: str,
@@ -1124,6 +1317,11 @@ class ListingService:
         После успеха — сообщает об успехе. Трекер автоматически
         исключит прокси с высоким процентом банов из пула,
         ускоряя ротацию на последующих карточках.
+
+        ИЗМЕНЕНИЕ (v2): перед ротацией проверяет is_context_alive.
+        Если контекст мёртв — сначала пересоздаёт его, затем
+        ротирует. Это устраняет ошибку, когда rotate_proxy()
+        пытался закрыть уже мёртвый контекст.
 
         Выполняет до MAX_PROXY_ROTATIONS_PER_LISTING ротаций прокси.
         После каждой ротации — навигация на карточку + стандартный
@@ -1140,7 +1338,7 @@ class ListingService:
             logger.warning(
                 "proxy_rotation_unavailable",
                 external_id=external_id,
-                reason="нет здоровых прокси в пуле",
+                reason="нет здоровых прокси в подпуле",
             )
             return None
 
@@ -1259,14 +1457,27 @@ class ListingService:
                     f"проверяю доступность..."
                 )
             except Exception as e:
+                error_text = str(e)
+
+                # Контекст разрушился во время retry — выходим
+                if _is_context_dead_error(error_text):
+                    logger.warning(
+                        "context_dead_during_unblock_retry",
+                        external_id=external_id,
+                        attempt=attempt,
+                        error=error_text[:150],
+                    )
+                    return False
+
                 logger.warning(
                     "listing_page_reload_failed",
                     external_id=external_id,
                     attempt=attempt,
-                    error=str(e),
+                    error=error_text[:200],
                 )
                 print(
-                    f"  [блокировка] Ошибка обновления страницы: {e}"
+                    f"  [блокировка] Ошибка обновления страницы: "
+                    f"{error_text[:100]}"
                 )
                 continue
 
@@ -1584,14 +1795,27 @@ class ListingService:
                     attempt=attempt,
                 )
             except Exception as e:
+                error_text = str(e)
+
+                # Контекст разрушился — немедленный выход
+                if _is_context_dead_error(error_text):
+                    logger.warning(
+                        "context_dead_during_calendar_reload",
+                        external_id=external_id,
+                        attempt=attempt,
+                        error=error_text[:150],
+                    )
+                    return False
+
                 logger.warning(
                     "page_reload_failed_for_calendar",
                     external_id=external_id,
                     attempt=attempt,
-                    error=str(e),
+                    error=error_text[:200],
                 )
                 print(
-                    f"  [календарь] Ошибка перезагрузки страницы: {e}"
+                    f"  [календарь] Ошибка перезагрузки страницы: "
+                    f"{error_text[:100]}"
                 )
                 continue
 

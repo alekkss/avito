@@ -17,6 +17,11 @@
 
 Интегрирован с ProxyHealthTracker для автоматического исключения
 «мёртвых» прокси (забаненных Avito или не отвечающих) из пула ротации.
+
+КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: метод _get_next_proxy() теперь выбирает прокси
+ТОЛЬКО из назначенного подпула воркера (_proxy_map), а не из
+глобального пула трекера. Это устраняет ошибку proxy_not_found_in_map,
+когда трекер возвращал прокси, принадлежащий другому воркеру.
 """
 
 import asyncio
@@ -434,6 +439,19 @@ PROXY_ERROR_MARKERS: tuple[str, ...] = (
     "PROXY_CONNECTION_FAILED",
 )
 
+# Маркеры ошибки разрушенного контекста/страницы Playwright.
+# Когда прокси-соединение обрывается, Playwright может закрыть
+# контекст — все последующие вызовы page.goto() будут падать с
+# этой ошибкой. Нужно пересоздать контекст, а не пытаться
+# использовать мёртвую page.
+CONTEXT_DEAD_MARKERS: tuple[str, ...] = (
+    "Target page, context or browser has been closed",
+    "has been closed",
+    "Target closed",
+    "Context closed",
+    "Browser closed",
+)
+
 # Максимальное количество смен прокси при навигации на каталог
 MAX_PROXY_RETRIES_ON_NAVIGATE: int = 10
 
@@ -556,6 +574,24 @@ def _is_proxy_error(error_text: str) -> bool:
     return any(marker in error_upper for marker in PROXY_ERROR_MARKERS)
 
 
+def _is_context_dead_error(error_text: str) -> bool:
+    """Проверяет, указывает ли ошибка на разрушенный контекст/страницу.
+
+    Когда прокси-соединение внезапно обрывается, Playwright может
+    закрыть BrowserContext. Все последующие вызовы page.goto() будут
+    падать с ошибкой «Target page, context or browser has been closed».
+    В этом случае нужно пересоздать контекст, а не пытаться
+    использовать мёртвую page.
+
+    Args:
+        error_text: Текст ошибки (str(exception)).
+
+    Returns:
+        True если ошибка указывает на разрушенный контекст.
+    """
+    return any(marker in error_text for marker in CONTEXT_DEAD_MARKERS)
+
+
 def _should_block_request(url: str, resource_type: str) -> bool:
     """Проверяет, нужно ли заблокировать запрос.
 
@@ -602,6 +638,13 @@ class BrowserService:
     автоматически исключает «мёртвые» прокси из пула, что ускоряет
     ротацию и снижает количество бесполезных попыток.
 
+    КЛЮЧЕВОЕ ИЗМЕНЕНИЕ (v2): _get_next_proxy() теперь выбирает прокси
+    ТОЛЬКО из своего подпула (_proxy_map). Раньше он использовал
+    health_tracker.get_next_healthy(), который возвращал сервер из
+    глобального пула всех воркеров → ошибка proxy_not_found_in_map.
+    Теперь: перебирает _proxies циклически, проверяя статус через
+    трекер, и возвращает первый здоровый из СВОЕГО набора.
+
     Поддерживает два режима:
     - Автономный: вызов launch() создаёт свой Playwright + Browser.
     - Воркер: вызов launch_for_worker() использует переданный Browser,
@@ -618,6 +661,8 @@ class BrowserService:
         _proxies: Список загруженных/назначенных прокси.
         _proxy_map: Словарь server → ProxyInfo для быстрого поиска.
         _current_proxy_server: URL текущего активного прокси (или "").
+        _current_proxy_index: Индекс текущего прокси в _proxies
+            для циклического перебора внутри своего подпула.
         _listings_since_rotation: Счётчик карточек с последней ротации.
         _owns_browser: True если этот экземпляр управляет жизненным
             циклом Playwright и Browser (автономный режим).
@@ -657,6 +702,7 @@ class BrowserService:
         self._proxies: list[ProxyInfo] = []
         self._proxy_map: dict[str, ProxyInfo] = {}
         self._current_proxy_server: str = ""
+        self._current_proxy_index: int = -1
         self._listings_since_rotation: int = 0
         self._owns_browser: bool = True
         self._worker_id = worker_id
@@ -719,47 +765,76 @@ class BrowserService:
         )
 
     def _get_next_proxy(self) -> ProxyInfo | None:
-        """Возвращает следующий здоровый прокси из пула.
+        """Возвращает следующий здоровый прокси из СВОЕГО подпула.
 
-        Делегирует выбор ProxyHealthTracker, который пропускает
-        прокси со статусом DEAD. Если все прокси мертвы —
+        КЛЮЧЕВОЕ ИЗМЕНЕНИЕ (v2): перебирает прокси ТОЛЬКО из
+        _proxies (назначенный подпул воркера), а НЕ из глобального
+        пула трекера. Для каждого кандидата проверяет статус через
+        health_tracker.is_dead(). Возвращает первый здоровый.
+
+        Это устраняет ошибку proxy_not_found_in_map: раньше
+        health_tracker.get_next_healthy() мог вернуть сервер,
+        принадлежащий другому воркеру, и _proxy_map.get() давал None.
+
+        Перебор циклический: начинает с позиции после текущего прокси,
+        проходит весь пул за один оборот. Если все прокси мертвы —
         возвращает None.
 
         Returns:
-            Следующий здоровый ProxyInfo или None.
+            Следующий здоровый ProxyInfo из своего подпула или None.
         """
         if not self._proxies:
             return None
 
-        healthy_server = self._health_tracker.get_next_healthy()
+        pool_size = len(self._proxies)
 
-        if healthy_server is None:
-            logger.error(
-                "no_healthy_proxies_available",
-                source=self._log_prefix(),
-                total=len(self._proxies),
+        # Перебираем весь свой подпул начиная со следующего индекса
+        for offset in range(1, pool_size + 1):
+            candidate_index = (
+                (self._current_proxy_index + offset) % pool_size
             )
-            return None
+            candidate = self._proxies[candidate_index]
 
-        proxy = self._proxy_map.get(healthy_server)
+            # Проверяем здоровье через общий трекер
+            if self._health_tracker.is_dead(candidate.server):
+                continue
 
-        if proxy is None:
-            logger.error(
-                "proxy_not_found_in_map",
+            # Нашли здоровый прокси — обновляем индекс
+            self._current_proxy_index = candidate_index
+
+            logger.info(
+                "proxy_selected",
                 source=self._log_prefix(),
-                server=healthy_server,
+                server=candidate.server,
+                pool_index=candidate_index,
+                pool_size=pool_size,
+                alive_in_pool=self._count_alive_in_pool(),
+                alive_global=self._health_tracker.alive_count,
+                total_global=self._health_tracker.total_count,
             )
-            return None
 
-        logger.info(
-            "proxy_selected",
+            return candidate
+
+        # Все прокси в нашем подпуле мертвы
+        logger.error(
+            "no_healthy_proxies_in_pool",
             source=self._log_prefix(),
-            server=proxy.server,
-            alive=self._health_tracker.alive_count,
-            total=self._health_tracker.total_count,
+            pool_size=pool_size,
+            alive_global=self._health_tracker.alive_count,
+            total_global=self._health_tracker.total_count,
         )
+        return None
 
-        return proxy
+    def _count_alive_in_pool(self) -> int:
+        """Считает количество живых прокси в своём подпуле.
+
+        Returns:
+            Количество прокси со статусом != DEAD в _proxies.
+        """
+        return sum(
+            1 for p in self._proxies
+            if not self._health_tracker.is_dead(p.server)
+        )
 
     @property
     def current_proxy_server(self) -> str:
@@ -781,6 +856,27 @@ class BrowserService:
             Экземпляр ProxyHealthTracker.
         """
         return self._health_tracker
+
+    @property
+    def is_context_alive(self) -> bool:
+        """Проверяет, жив ли текущий BrowserContext и Page.
+
+        Используется для раннего обнаружения разрушенного
+        контекста (после обрыва прокси-соединения) без попытки
+        навигации. Позволяет listing_service быстро инициировать
+        пересоздание контекста вместо бесполезных retry.
+
+        Returns:
+            True если контекст и страница существуют и не закрыты.
+        """
+        if self._context is None or self._page is None:
+            return False
+
+        try:
+            # Проверяем, что page не закрыта
+            return not self._page.is_closed()
+        except Exception:
+            return False
 
     def report_success(self) -> None:
         """Сообщает трекеру об успешном использовании текущего прокси.
@@ -1104,15 +1200,91 @@ class BrowserService:
                 f"{self._log_prefix()}: {e}"
             ) from e
 
+    async def recreate_context(self) -> Page:
+        """Пересоздаёт BrowserContext на текущем прокси.
+
+        Используется при обнаружении ошибки «Target page, context or
+        browser has been closed». В этом случае контекст разрушен
+        (Playwright закрыл его из-за обрыва прокси-соединения), но
+        сам Browser жив. Создаём новый контекст на том же прокси —
+        прокси мог временно потерять соединение, но не быть забаненным.
+
+        Если текущий прокси мёртв (по данным трекера) — выбирает
+        следующий здоровый из своего подпула.
+
+        Returns:
+            Новая страница Playwright с чистым контекстом.
+
+        Raises:
+            RuntimeError: Если браузер не запущен или нет живых прокси.
+        """
+        if self._browser is None:
+            raise RuntimeError(
+                "Пересоздание контекста невозможно: браузер не запущен."
+            )
+
+        # Пытаемся закрыть старый контекст (может быть уже мёртв)
+        if self._context is not None:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
+            self._page = None
+
+        # Определяем, какой прокси использовать
+        proxy_to_use: ProxyInfo | None = None
+
+        if self._current_proxy_server:
+            # Текущий прокси ещё жив? Используем его же.
+            if not self._health_tracker.is_dead(self._current_proxy_server):
+                proxy_to_use = self._proxy_map.get(
+                    self._current_proxy_server
+                )
+            else:
+                # Текущий мёртв — берём следующий здоровый
+                proxy_to_use = self._get_next_proxy()
+                if proxy_to_use is None:
+                    raise RuntimeError(
+                        "Пересоздание контекста невозможно: "
+                        "все прокси в подпуле мертвы."
+                    )
+        else:
+            # Без прокси — просто пересоздаём контекст
+            proxy_to_use = None
+
+        self._current_proxy_server = (
+            proxy_to_use.server if proxy_to_use else ""
+        )
+
+        # Создаём новый контекст
+        self._context = await self._create_context(proxy=proxy_to_use)
+        self._page = await self._create_page_with_stealth(self._context)
+
+        # Сбрасываем счётчик
+        self._listings_since_rotation = 0
+
+        logger.info(
+            "context_recreated",
+            source=self._log_prefix(),
+            proxy_server=self._current_proxy_server or "без прокси",
+            reason="контекст был разрушен (Target page closed)",
+        )
+
+        # Небольшая пауза после пересоздания
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+
+        return self._page
+
     async def rotate_proxy(self) -> Page:
-        """Переключается на следующий здоровый прокси из пула.
+        """Переключается на следующий здоровый прокси из подпула.
 
         Закрывает текущий контекст (cookies, session, fingerprint),
-        берёт следующий здоровый прокси через трекер, создаёт
-        полностью новый контекст с новым User-Agent, viewport
-        и прокси. Chromium-процесс НЕ перезапускается.
+        берёт следующий здоровый прокси из СВОЕГО подпула через
+        _get_next_proxy(), создаёт полностью новый контекст с новым
+        User-Agent, viewport и прокси. Chromium-процесс НЕ перезапускается.
 
-        Если все прокси мертвы — выбрасывает RuntimeError.
+        Если все прокси в подпуле мертвы — выбрасывает RuntimeError.
 
         Returns:
             Новая страница Playwright с чистым контекстом.
@@ -1146,7 +1318,7 @@ class BrowserService:
             self._context = None
             self._page = None
 
-        # Берём следующий здоровый прокси через трекер
+        # Берём следующий здоровый прокси ИЗ СВОЕГО ПОДПУЛА
         next_proxy = self._get_next_proxy()
 
         if next_proxy is None:
@@ -1173,8 +1345,9 @@ class BrowserService:
             source=self._log_prefix(),
             old_server=old_proxy_server,
             new_server=next_proxy.server,
-            alive=self._health_tracker.alive_count,
-            total=self._health_tracker.total_count,
+            alive_in_pool=self._count_alive_in_pool(),
+            alive_global=self._health_tracker.alive_count,
+            total_global=self._health_tracker.total_count,
         )
 
         # Пауза после смены прокси — имитация нового пользователя
@@ -1223,14 +1396,19 @@ class BrowserService:
 
     @property
     def has_proxies(self) -> bool:
-        """Проверяет, есть ли здоровые прокси в пуле.
+        """Проверяет, есть ли здоровые прокси в подпуле воркера.
+
+        ИЗМЕНЕНО (v2): проверяет именно свой подпул (_proxies),
+        а не глобальный alive_count трекера. Это корректнее:
+        у другого воркера могут быть живые прокси, но данный
+        воркер не может их использовать.
 
         Returns:
-            True если есть хотя бы один живой прокси.
+            True если есть хотя бы один живой прокси в подпуле.
         """
         if not self._proxies:
             return False
-        return self._health_tracker.alive_count > 0
+        return self._count_alive_in_pool() > 0
 
     async def navigate(self, url: str) -> bool:
         """Переходит по URL с предварительной задержкой и проверкой блокировки.
@@ -1291,7 +1469,7 @@ class BrowserService:
             )
             return False
 
-        alive_count = self._health_tracker.alive_count
+        alive_count = self._count_alive_in_pool()
         max_retries = min(MAX_PROXY_RETRIES_ON_NAVIGATE, alive_count)
 
         if max_retries <= 0:
@@ -1299,7 +1477,7 @@ class BrowserService:
                 "no_healthy_proxies_for_retry",
                 source=self._log_prefix(),
                 url=url[:200],
-                total=len(self._proxies),
+                pool_size=len(self._proxies),
             )
             return False
 
@@ -1310,7 +1488,7 @@ class BrowserService:
                 url=url[:200],
                 retry=retry,
                 max_retries=max_retries,
-                alive=self._health_tracker.alive_count,
+                alive_in_pool=self._count_alive_in_pool(),
             )
             print(
                 f"  [{self._log_prefix()}][прокси] Прокси не работает. "
@@ -1435,6 +1613,19 @@ class BrowserService:
 
         except Exception as e:
             error_text = str(e)
+
+            # Определяем: это ошибка разрушенного контекста?
+            if _is_context_dead_error(error_text):
+                logger.warning(
+                    "navigation_context_dead",
+                    source=self._log_prefix(),
+                    url=url[:200],
+                    error=error_text[:200],
+                    server=self._current_proxy_server,
+                )
+                # Возвращаем None — это эквивалент ошибки прокси:
+                # контекст уничтожен, нужна ротация/пересоздание
+                return None
 
             # Определяем: это ошибка прокси или что-то другое?
             if _is_proxy_error(error_text):
