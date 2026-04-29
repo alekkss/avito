@@ -9,6 +9,12 @@
 об успехе (BrowserService.report_success()). Это позволяет
 трекеру автоматически исключать «мёртвые» прокси из пула.
 
+При провале загрузки календаря (datepicker не грузится из-за
+бана прокси) — автоматически ротирует прокси и повторяет
+парсинг всей карточки с нового IP (до MAX_PROXY_ROTATIONS_PER_LISTING
+попыток). Это устраняет основную причину потери карточек:
+бессмысленные retry на забаненном прокси.
+
 Паттерн Strategy: при переходе на другую площадку (Суточно.ру)
 можно создать альтернативную реализацию с тем же интерфейсом.
 """
@@ -51,14 +57,19 @@ MAX_LISTING_UNBLOCK_RETRIES: int = 5
 LISTING_UNBLOCK_WAIT: int = 15
 
 # Максимальное количество смен прокси для одной карточки
-# (защита от бесконечного цикла ротации)
+# (защита от бесконечного цикла ротации).
+# Используется в двух местах:
+# 1. _retry_with_proxy_rotation() — при блокировке навигации.
+# 2. parse_listing() — при провале загрузки календаря.
 MAX_PROXY_ROTATIONS_PER_LISTING: int = 3
 
 # Минимальный срок аренды по умолчанию, если не удалось прочитать
 # из датепикера (выбранная дата + 1 день = 2 суток)
 DEFAULT_MIN_STAY_FALLBACK: int = 2
 
-# Количество попыток перезагрузки страницы при отсутствии календаря
+# Количество попыток перезагрузки страницы при отсутствии календаря.
+# ВАЖНО: при обнаружении бана retry прерывается досрочно —
+# управление возвращается в parse_listing() для ротации прокси.
 MAX_CALENDAR_RELOAD_RETRIES: int = 3
 
 # Ожидание перед перезагрузкой страницы при отсутствии календаря (секунды)
@@ -230,8 +241,10 @@ class ListingService:
     BrowserService.report_success(). Это позволяет трекеру
     автоматически исключать прокси с высоким процентом банов.
 
-    При стандартных retry исчерпаны и доступны прокси — выполняет
-    ротацию прокси и пробует снова с новым IP.
+    При провале загрузки календаря — автоматически ротирует прокси
+    и повторяет парсинг всей карточки с нового IP. Это ключевое
+    отличие от предыдущей версии, где карточка терялась при первом
+    же провале datepicker.
 
     Attributes:
         _browser_service: Сервис управления браузером.
@@ -261,15 +274,14 @@ class ListingService:
         данные, затем проходит по каждому свободному дню и через
         датепикер получает реальную цену за сутки.
 
-        При успешном парсинге сообщает трекеру здоровья об успехе
-        текущего прокси. При провале (календарь не загрузился) —
-        не сообщает (бан уже зарегистрирован в _navigate_to_listing
-        или _retry_with_proxy_rotation).
-
-        Если календарь (datepicker) не удалось загрузить после
-        всех попыток перезагрузки — карточка считается проваленной
-        и возвращается None. Мусорные данные (все дни заняты,
-        все цены нулевые) в БД НЕ записываются.
+        КЛЮЧЕВОЕ ПОВЕДЕНИЕ — ротация прокси при провале календаря:
+        Если datepicker не загрузился (прокси забанен) — метод
+        НЕ возвращает None сразу. Вместо этого он ротирует прокси
+        и повторяет парсинг всей карточки с нового IP (навигация +
+        календарь + цены). До MAX_PROXY_ROTATIONS_PER_LISTING попыток.
+        Карточка помечается как проваленная (return None) только если:
+        - Все ротации прокси исчерпаны.
+        - Или нет здоровых прокси в пуле.
 
         Args:
             page: Активная страница Playwright.
@@ -283,7 +295,7 @@ class ListingService:
 
         Returns:
             Заполненный RawListing или None при ошибке парсинга
-            (включая случай, когда календарь не загрузился).
+            (включая случай, когда все ротации прокси исчерпаны).
         """
         # Очищаем URL от query-параметров бронирования
         clean_url = _clean_listing_url(url)
@@ -292,116 +304,192 @@ class ListingService:
             else f"https://www.avito.ru{clean_url}"
         )
 
-        # Используем текущую page из browser_service
-        current_page = self._browser_service.page or page
+        # === Основной цикл: попытка парсинга с ротацией прокси ===
+        # Попытка 0 = текущий прокси, попытки 1..N = после ротации.
+        # Ротация происходит ТОЛЬКО при провале календаря (бан прокси),
+        # а не при любой ошибке — это экономит здоровые прокси.
+        max_attempts = 1 + MAX_PROXY_ROTATIONS_PER_LISTING
+        for attempt in range(max_attempts):
+            is_retry_after_rotation = attempt > 0
 
-        # Попытка навигации на карточку с обработкой блокировки
-        navigated = await self._navigate_to_listing(
-            current_page, external_id, full_url
-        )
+            if is_retry_after_rotation:
+                # Ротируем прокси перед повторной попыткой
+                if not self._browser_service.has_proxies:
+                    logger.warning(
+                        "calendar_retry_no_proxies",
+                        external_id=external_id,
+                        attempt=attempt,
+                        reason="нет здоровых прокси в пуле",
+                    )
+                    return None
 
-        if not navigated:
-            current_page = await self._retry_with_proxy_rotation(
-                external_id, full_url
-            )
-            if current_page is None:
-                logger.warning(
-                    "listing_page_permanently_blocked",
+                logger.info(
+                    "calendar_retry_rotating_proxy",
                     external_id=external_id,
-                    max_proxy_rotations=MAX_PROXY_ROTATIONS_PER_LISTING,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
+                print(
+                    f"  [прокси] Смена прокси для календаря "
+                    f"{external_id} (попытка {attempt}/"
+                    f"{MAX_PROXY_ROTATIONS_PER_LISTING})"
+                )
+
+                try:
+                    new_page = await self._browser_service.rotate_proxy()
+                    page = new_page
+                except RuntimeError as e:
+                    logger.error(
+                        "calendar_retry_rotation_failed",
+                        external_id=external_id,
+                        attempt=attempt,
+                        error=str(e),
+                    )
+                    return None
+
+            # Берём актуальную page из browser_service
+            current_page = self._browser_service.page or page
+
+            # --- Навигация на карточку ---
+            navigated = await self._navigate_to_listing(
+                current_page, external_id, full_url
+            )
+
+            if not navigated:
+                # Навигация заблокирована — пробуем ротацию для навигации
+                current_page = await self._retry_with_proxy_rotation(
+                    external_id, full_url
+                )
+                if current_page is None:
+                    logger.warning(
+                        "listing_page_permanently_blocked",
+                        external_id=external_id,
+                        max_proxy_rotations=MAX_PROXY_ROTATIONS_PER_LISTING,
+                    )
+                    return None
+
+            # После возможной ротации берём актуальную page
+            current_page = self._browser_service.page or current_page
+
+            # --- Извлекаем данные ---
+            coordinates = await self._extract_coordinates(
+                current_page, external_id
+            )
+            calendar_data = await self._extract_calendar_data(
+                current_page, external_id, full_url
+            )
+
+            # --- Проверяем, удалось ли извлечь календарь ---
+            raw_calendar = calendar_data.get("calendar", [])
+            calendar_failed = len(raw_calendar) == 0
+
+            if calendar_failed:
+                # Календарь не загрузился — прокси скорее всего забанен.
+                # Вместо return None — продолжаем цикл для ротации прокси.
+                if attempt < max_attempts - 1:
+                    logger.warning(
+                        "calendar_empty_will_retry_with_new_proxy",
+                        external_id=external_id,
+                        attempt=attempt,
+                        remaining_attempts=max_attempts - attempt - 1,
+                        has_proxies=self._browser_service.has_proxies,
+                    )
+                    print(
+                        f"  [календарь] {external_id}: календарь "
+                        f"не получен — смена прокси и повтор "
+                        f"(осталось {max_attempts - attempt - 1} "
+                        f"попыток)"
+                    )
+                    continue
+
+                # Все попытки исчерпаны — карточка действительно провалена
+                logger.warning(
+                    "calendar_empty_listing_failed",
+                    external_id=external_id,
+                    reason=(
+                        "datepicker не загрузился после всех "
+                        "попыток и ротаций прокси"
+                    ),
+                    total_attempts=max_attempts,
+                )
+                print(
+                    f"  [календарь] {external_id}: календарь не получен "
+                    f"после {max_attempts} попыток (вкл. "
+                    f"{MAX_PROXY_ROTATIONS_PER_LISTING} ротаций прокси) "
+                    f"— карточка считается проваленной."
                 )
                 return None
 
-        # После возможной ротации берём актуальную page
-        current_page = self._browser_service.page or current_page
-
-        # Извлекаем данные
-        coordinates = await self._extract_coordinates(
-            current_page, external_id
-        )
-        calendar_data = await self._extract_calendar_data(
-            current_page, external_id, full_url
-        )
-        room_category = await self._extract_room_category(
-            current_page, title
-        )
-        last_host_update = await self._extract_last_update(current_page)
-
-        host_rating = catalog_host_rating
-        if host_rating == 0.0:
-            host_rating = await self._extract_host_rating(current_page)
-
-        instant_book = is_instant_book
-        if not instant_book:
-            instant_book = await self._extract_instant_book(
-                current_page, external_id
+            # === Календарь получен — извлекаем остальные данные ===
+            # (выходим из цикла ротации)
+            room_category = await self._extract_room_category(
+                current_page, title
+            )
+            last_host_update = await self._extract_last_update(
+                current_page
             )
 
-        # Проверяем, удалось ли извлечь календарь.
-        # Если calendar пустой — datepicker так и не загрузился:
-        # карточка считается проваленной, возвращаем None.
-        # Мусорные данные (все дни заняты, все цены = 0)
-        # в БД НЕ записываются — карточка попадёт в failover.
-        raw_calendar = calendar_data.get("calendar", [])
-        calendar_failed = len(raw_calendar) == 0
+            host_rating = catalog_host_rating
+            if host_rating == 0.0:
+                host_rating = await self._extract_host_rating(
+                    current_page
+                )
 
-        if calendar_failed:
-            logger.warning(
-                "calendar_empty_listing_failed",
+            instant_book = is_instant_book
+            if not instant_book:
+                instant_book = await self._extract_instant_book(
+                    current_page, external_id
+                )
+
+            calendar_60 = self._pad_array(raw_calendar, 60, 0)
+            min_stay = calendar_data.get("minStay", 1)
+
+            # === Извлечение реальных цен через датепикер ===
+            prices_60 = await self._extract_prices_for_free_days(
+                current_page,
+                external_id,
+                calendar_60,
+                min_stay,
+                base_price,
+            )
+
+            listing = RawListing(
                 external_id=external_id,
-                reason="datepicker не загрузился после всех попыток",
+                latitude=coordinates["latitude"],
+                longitude=coordinates["longitude"],
+                room_category=room_category,
+                price_60_days=prices_60,
+                calendar_60_days=calendar_60,
+                snapshot_timestamp=datetime.now(timezone.utc),
+                last_host_update=last_host_update,
+                min_stay=min_stay,
+                is_instant_book=instant_book,
+                host_rating=host_rating,
+                url=url,
+                title=title,
             )
-            print(
-                f"  [календарь] {external_id}: календарь не получен — "
-                f"карточка считается проваленной (будет повторена "
-                f"с другим прокси)."
+
+            # Успешный парсинг — сообщаем трекеру
+            self._browser_service.report_success()
+
+            logger.info(
+                "listing_parsed",
+                external_id=external_id,
+                room_category=room_category.value,
+                latitude=coordinates["latitude"],
+                longitude=coordinates["longitude"],
+                occupancy=f"{listing.occupancy_rate:.0%}",
+                avg_price=round(listing.average_price),
+                is_instant_book=instant_book,
+                host_rating=host_rating,
+                proxy_rotations_used=attempt,
             )
-            return None
 
-        calendar_60 = self._pad_array(raw_calendar, 60, 0)
-        min_stay = calendar_data.get("minStay", 1)
+            return listing
 
-        # === Извлечение реальных цен через датепикер ===
-        prices_60 = await self._extract_prices_for_free_days(
-            current_page,
-            external_id,
-            calendar_60,
-            min_stay,
-            base_price,
-        )
-
-        listing = RawListing(
-            external_id=external_id,
-            latitude=coordinates["latitude"],
-            longitude=coordinates["longitude"],
-            room_category=room_category,
-            price_60_days=prices_60,
-            calendar_60_days=calendar_60,
-            snapshot_timestamp=datetime.now(timezone.utc),
-            last_host_update=last_host_update,
-            min_stay=min_stay,
-            is_instant_book=instant_book,
-            host_rating=host_rating,
-            url=url,
-            title=title,
-        )
-
-        # Успешный парсинг — сообщаем трекеру
-        self._browser_service.report_success()
-
-        logger.info(
-            "listing_parsed",
-            external_id=external_id,
-            room_category=room_category.value,
-            latitude=coordinates["latitude"],
-            longitude=coordinates["longitude"],
-            occupancy=f"{listing.occupancy_rate:.0%}",
-            avg_price=round(listing.average_price),
-            is_instant_book=instant_book,
-            host_rating=host_rating,
-        )
-
-        return listing
+        # Сюда не должны попасть — цикл for всегда
+        # завершается через return. Но на всякий случай:
+        return None
 
     # ==================================================================
     # Извлечение реальных цен через датепикер
@@ -1320,6 +1408,12 @@ class ListingService:
         Если datepicker не подгрузился — ожидает 10 секунд,
         перезагружает страницу и пробует снова (до 3 попыток).
 
+        ВАЖНО: при обнаружении бана во время reload — retry
+        прерывается ДОСРОЧНО (return с пустым calendar).
+        Это позволяет вызывающему коду (parse_listing) быстро
+        сменить прокси и повторить, вместо бесполезного ожидания
+        на забаненном IP.
+
         Args:
             page: Активная страница Playwright.
             external_id: ID объявления для логирования.
@@ -1440,12 +1534,16 @@ class ListingService:
     ) -> bool:
         """Перезагружает страницу и повторно пытается открыть datepicker.
 
-        При обнаружении блокировки после перезагрузки — сообщает
-        трекеру о бане текущего прокси.
+        КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: при обнаружении бана после перезагрузки —
+        немедленно прерывает retry и возвращает False. Это позволяет
+        вызывающему коду (parse_listing) быстро сменить прокси
+        и повторить парсинг карточки с нового IP, вместо бесполезного
+        ожидания на забаненном прокси (раньше: 3 × 10 сек = 30 сек
+        впустую; теперь: мгновенный выход → ротация → повтор).
 
-        Выполняет до MAX_CALENDAR_RELOAD_RETRIES попыток:
-        ожидание CALENDAR_RELOAD_WAIT_SECONDS секунд →
-        перезагрузка страницы → попытка открыть datepicker.
+        Retry продолжается только если страница загрузилась без бана,
+        но datepicker по-прежнему не появился (редкий случай —
+        JS не прогрузился, сетевая задержка и т.д.).
 
         Args:
             page: Активная страница Playwright.
@@ -1497,7 +1595,10 @@ class ListingService:
                 )
                 continue
 
-            # Проверяем, не заблокирована ли страница после reload
+            # Проверяем, не заблокирована ли страница после reload.
+            # КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: при бане — немедленный выход
+            # из retry. Бессмысленно перезагружать страницу на том же
+            # забаненном прокси — нужна ротация на уровне parse_listing.
             is_blocked = await self._browser_service._check_blocked()
             if is_blocked:
                 # Сообщаем трекеру о бане
@@ -1510,10 +1611,13 @@ class ListingService:
                 )
                 print(
                     f"  [календарь] Страница заблокирована после "
-                    f"перезагрузки (попытка {attempt}/"
-                    f"{MAX_CALENDAR_RELOAD_RETRIES})"
+                    f"перезагрузки — прокси забанен. "
+                    f"Прерываю retry, нужна смена прокси."
                 )
-                continue
+                # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: немедленный выход вместо continue.
+                # Раньше: continue → ещё 2 бесполезных reload по 10 сек.
+                # Теперь: return False → parse_listing() сменит прокси.
+                return False
 
             # Пробуем открыть datepicker заново
             datepicker_opened = await self._open_datepicker(

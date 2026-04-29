@@ -9,8 +9,9 @@
 у одного воркера, остальные об этом узнают и пропустят его при ротации.
 
 После основного раунда проваленные карточки автоматически
-перезапускаются в failover-раундах (до MAX_FAILOVER_ROUNDS попыток)
-с использованием оставшихся здоровых прокси.
+перезапускаются в failover-раунде (1 попытка) с использованием
+оставшихся здоровых прокси. Количество failover-раундов минимально,
+т.к. ListingService теперь сам ротирует прокси при провале календаря.
 
 Паттерн Strategy: ParallelListingService заменяет последовательный
 обход карточек в ScraperService._parse_all_listings() на параллельный,
@@ -41,26 +42,37 @@ logger = get_logger("parallel_listing_service")
 # Максимальное количество воркеров при автоопределении
 MAX_AUTO_WORKERS: int = 10
 
-# Максимальное количество failover-раундов
-MAX_FAILOVER_ROUNDS: int = 3
+# Максимальное количество failover-раундов.
+# Снижено с 3 до 1: ListingService теперь сам ротирует прокси
+# при провале календаря (до 3 ротаций на карточку). Если карточка
+# провалилась после 3 ротаций внутри ListingService — один
+# failover-раунд с полностью новой сессией даёт последний шанс.
+# Больше раундов бессмысленно: прокси уже исчерпаны.
+MAX_FAILOVER_ROUNDS: int = 1
+
+# Максимальное количество воркеров для failover-раунда.
+# Меньше, чем для основного раунда, т.к. здоровых прокси осталось мало.
+MAX_FAILOVER_WORKERS: int = 3
 
 # Пауза между failover-раундами (секунды),
 # позволяет Avito «забыть» о предыдущих запросах
-FAILOVER_COOLDOWN_MIN: float = 5.0
-FAILOVER_COOLDOWN_MAX: float = 10.0
+FAILOVER_COOLDOWN_MIN: float = 15.0
+FAILOVER_COOLDOWN_MAX: float = 30.0
 
 # URL для «прогрева» нового контекста воркера
 WARMUP_URL: str = "https://www.avito.ru"
 
 # Минимальная пауза между стартом воркеров (секунды),
 # чтобы не создавать одновременную нагрузку
-WORKER_STAGGER_DELAY_MIN: float = 2.0
-WORKER_STAGGER_DELAY_MAX: float = 5.0
+WORKER_STAGGER_DELAY_MIN: float = 3.0
+WORKER_STAGGER_DELAY_MAX: float = 7.0
 
-# Пауза между обработкой карточек внутри воркера (секунды),
-# имитирует человеческий ритм просмотра объявлений
-WORKER_INTER_CARD_DELAY_MIN: float = 1.0
-WORKER_INTER_CARD_DELAY_MAX: float = 3.0
+# Пауза между обработкой карточек внутри воркера (секунды).
+# Имитирует человеческий ритм просмотра объявлений.
+# Увеличена с 1-3 сек до 3-6 сек: слишком частые запросы
+# вызывают подозрения у антибот-системы Avito.
+WORKER_INTER_CARD_DELAY_MIN: float = 3.0
+WORKER_INTER_CARD_DELAY_MAX: float = 6.0
 
 
 @dataclass
@@ -228,8 +240,10 @@ class ParallelListingService:
     Это устраняет бесполезные retry на заведомо мёртвых прокси.
 
     После основного раунда проваленные карточки автоматически
-    перезапускаются в failover-раундах с использованием оставшихся
-    здоровых прокси (до MAX_FAILOVER_ROUNDS попыток).
+    перезапускаются в failover-раунде (до MAX_FAILOVER_ROUNDS попыток)
+    с использованием оставшихся здоровых прокси. Количество failover
+    минимально, т.к. ListingService теперь сам ротирует прокси при
+    провале календаря.
 
     При отсутствии прокси или max_workers=1 — работает в один
     поток, полностью совместим с текущим поведением.
@@ -388,12 +402,13 @@ class ParallelListingService:
                 # Перенумеровываем карточки для нового раунда
                 _renumber_items(failed_items)
 
-                # Количество воркеров для failover — не более
-                # здоровых прокси и не более проваленных карточек
+                # Количество воркеров для failover — минимальное:
+                # не более здоровых прокси, не более проваленных карточек,
+                # не более MAX_FAILOVER_WORKERS (защита от лавины).
                 failover_worker_count = min(
                     len(healthy_proxies),
                     len(failed_items),
-                    MAX_AUTO_WORKERS,
+                    MAX_FAILOVER_WORKERS,
                 )
                 failover_worker_count = max(failover_worker_count, 1)
 
@@ -411,7 +426,9 @@ class ParallelListingService:
                     f"({len(healthy_proxies)} здоровых прокси)"
                 )
 
-                # Пауза перед failover — даём Avito «остыть»
+                # Увеличенная пауза перед failover — даём Avito «остыть».
+                # Увеличена с 5-10 сек до 15-30 сек для лучшего сброса
+                # бан-счётчиков на стороне Avito.
                 cooldown = random.uniform(
                     FAILOVER_COOLDOWN_MIN, FAILOVER_COOLDOWN_MAX
                 )
@@ -419,6 +436,9 @@ class ParallelListingService:
                     "failover_cooldown",
                     round=failover_round,
                     delay=round(cooldown, 1),
+                )
+                print(
+                    f"  ⏳ Пауза {cooldown:.0f} сек перед failover..."
                 )
                 await asyncio.sleep(cooldown)
 
@@ -571,7 +591,8 @@ class ParallelListingService:
             )
             tasks.append(task)
 
-            # Стаггеринг между запуском воркеров
+            # Увеличенный стаггеринг между запуском воркеров —
+            # равномерно распределяет нагрузку на Avito
             if i < worker_count - 1:
                 stagger = random.uniform(
                     WORKER_STAGGER_DELAY_MIN,
@@ -645,8 +666,12 @@ class ParallelListingService:
     ) -> WorkerResult:
         """Цикл работы одного воркера.
 
-        Инициализирует свой BrowserContext, прогревает его,
-        затем в цикле берёт карточки из очереди и парсит.
+        Инициализирует свой BrowserContext, прогревает его через
+        warmup_session(), затем в цикле берёт карточки из очереди
+        и парсит. После каждой карточки проверяет, не была ли
+        ротация прокси внутри ListingService — если да, выполняет
+        прогрев новой сессии.
+
         Завершается при получении None (отравляющая пилюля).
 
         Args:
@@ -668,6 +693,10 @@ class ParallelListingService:
         prefix = f"worker_{worker_id}"
         worker_start = time.monotonic()
 
+        # Запоминаем текущий прокси для отслеживания ротаций
+        # внутри ListingService (Шаг 1 — ротация при провале календаря)
+        current_proxy_before: str = ""
+
         try:
             # --- Инициализация контекста ---
             page = await browser_service.launch_for_worker(browser)
@@ -678,8 +707,13 @@ class ParallelListingService:
                 proxy_count=len(browser_service._proxies),
             )
 
-            # --- Прогрев: заходим на главную Avito ---
-            await self._warmup_worker(browser_service, page, worker_id)
+            # --- Прогрев: обход нейтральных страниц Avito ---
+            # Использует новый warmup_session() вместо простого navigate(),
+            # который обходит 1-2 случайные страницы с реалистичным
+            # поведением для создания легитимной cookie-сессии.
+            await browser_service.warmup_session()
+
+            current_proxy_before = browser_service.current_proxy_server
 
             # --- Основной цикл обработки карточек ---
             while True:
@@ -758,8 +792,32 @@ class ParallelListingService:
                 finally:
                     queue.task_done()
 
-                # Обновляем page после возможной ротации внутри
-                # listing_service
+                # === Отслеживание ротации прокси внутри ListingService ===
+                # ListingService может ротировать прокси при провале
+                # календаря (Шаг 1). Если это произошло — прокси изменился,
+                # нужно обновить page и выполнить прогрев новой сессии.
+                current_proxy_after = browser_service.current_proxy_server
+                if current_proxy_after != current_proxy_before:
+                    logger.info(
+                        "worker_proxy_changed_by_listing_service",
+                        worker_id=worker_id,
+                        old_proxy=current_proxy_before,
+                        new_proxy=current_proxy_after,
+                    )
+                    print(
+                        f"  [{prefix}] Прокси изменён внутри "
+                        f"ListingService → прогрев новой сессии"
+                    )
+
+                    # Обновляем page
+                    if browser_service.page is not None:
+                        page = browser_service.page
+
+                    # Прогрев новой сессии после ротации
+                    await browser_service.warmup_session()
+                    current_proxy_before = current_proxy_after
+
+                # Обновляем page после возможной ротации
                 if browser_service.page is not None:
                     page = browser_service.page
 
@@ -779,12 +837,14 @@ class ParallelListingService:
                         f"  [{prefix}] Плановая смена прокси "
                         f"(обработано {successful + failed} карточек)"
                     )
-                    # Прогрев после ротации
-                    await self._warmup_worker(
-                        browser_service, page, worker_id
+                    # Прогрев после плановой ротации
+                    await browser_service.warmup_session()
+                    current_proxy_before = (
+                        browser_service.current_proxy_server
                     )
 
-                # Пауза между карточками — имитация человека
+                # Пауза между карточками — имитация человека.
+                # Увеличена до 3-6 сек для снижения частоты запросов.
                 delay = random.uniform(
                     WORKER_INTER_CARD_DELAY_MIN,
                     WORKER_INTER_CARD_DELAY_MAX,
@@ -825,51 +885,6 @@ class ParallelListingService:
             elapsed=worker_elapsed,
             failed_items=failed_items,
         )
-
-    async def _warmup_worker(
-        self,
-        browser_service: BrowserService,
-        page: object,
-        worker_id: int,
-    ) -> None:
-        """Прогревает контекст воркера.
-
-        Заходит на главную Avito, чтобы получить cookies
-        и выглядеть как обычный пользователь. Снижает
-        вероятность бана на первой карточке.
-
-        Args:
-            browser_service: BrowserService воркера.
-            page: Страница воркера (не используется напрямую,
-                навигация идёт через browser_service).
-            worker_id: ID воркера для логирования.
-        """
-        try:
-            logger.info(
-                "worker_warmup_started",
-                worker_id=worker_id,
-                url=WARMUP_URL,
-            )
-
-            success = await browser_service.navigate(WARMUP_URL)
-            if success:
-                await browser_service.simulate_human_behavior()
-                logger.info(
-                    "worker_warmup_completed",
-                    worker_id=worker_id,
-                )
-            else:
-                logger.warning(
-                    "worker_warmup_failed",
-                    worker_id=worker_id,
-                )
-
-        except Exception as e:
-            logger.warning(
-                "worker_warmup_error",
-                worker_id=worker_id,
-                error=str(e),
-            )
 
     def _load_all_proxies(self) -> list[ProxyInfo]:
         """Загружает полный пул прокси из файла.
